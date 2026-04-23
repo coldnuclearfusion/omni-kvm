@@ -9,9 +9,9 @@
 
 #include <Arduino.h>
 
-// The ESP32-S3-DevKitC-1 has a WS2812 RGB LED on GPIO 48.
-// The Arduino-ESP32 core provides neopixelWrite() for this.
-static const uint8_t LED_PIN = 48;
+// The ESP32-S3-DevKitC-1 has a WS2812 RGB LED on GPIO 38.
+// (The PCB silkscreen labels this as "RGB@IO38".)
+static const uint8_t LED_PIN = 38;
 
 // ── Setup: runs once at boot ──────────────────────────────
 void setup() {
