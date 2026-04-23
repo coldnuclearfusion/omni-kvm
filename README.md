@@ -41,8 +41,9 @@ See `docs/architecture.md` for the full design.
 
 ## Hardware
 
-- 2× ESP32-S3-DevKitC-1-N8R8 development boards
-- 2× USB-C cables (data-capable; one C-to-C and one C-to-A recommended)
+* 2× ESP32-S3-DevKitC-1-N8R8 development boards
+* 2× Micro-USB data cables for development (USB-A to Micro-USB; standard Android-style cables work)
+* For deployment: Micro-USB to USB-A (for desktops) and Micro-USB to USB-C (for modern laptops)
 
 Total parts cost: roughly KRW 65,000 / USD 50.
 
