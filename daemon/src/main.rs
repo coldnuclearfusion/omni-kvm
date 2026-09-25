@@ -1,17 +1,26 @@
 //! Omni-KVM host daemon.
 //!
-//! Phase 3, step 1: find the local board, then report its radio link
-//! every two seconds. Input capture and forwarding come next.
+//! Phase 3, step 2: capture this PC's keyboard and mouse (Windows) and,
+//! while the pointer is "on the Mac", forward them to the local board,
+//! which relays them over the radio to the board plugged into the Mac.
 
 mod board;
+mod input_windows;
+mod keymap;
 mod protocol;
 
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
 
 use board::Board;
+use input_windows::Event;
+use protocol::msg;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 fn main() {
     println!("Omni-KVM daemon {}", env!("CARGO_PKG_VERSION"));
@@ -19,23 +28,110 @@ fn main() {
     // boards are plugged into this computer (e.g. during development).
     let wanted_port = std::env::args().nth(1);
 
+    let (tx, rx) = mpsc::channel();
+    let link_up = Arc::new(AtomicBool::new(false));
+    {
+        let link_up = link_up.clone();
+        thread::spawn(move || board_loop(rx, link_up, wanted_port));
+    }
+    // The hooks must live on a thread that pumps messages: this one.
+    if let Err(e) = input_windows::run(tx, link_up) {
+        eprintln!("Input capture failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Keeps a connection to the board, forwarding input events and tracking the link.
+fn board_loop(rx: Receiver<Event>, link_up: Arc<AtomicBool>, wanted_port: Option<String>) {
     loop {
-        let port = match choose_board(wanted_port.as_deref()) {
-            Some(p) => p,
-            None => {
-                sleep(POLL_INTERVAL);
-                continue;
+        link_up.store(false, Ordering::Relaxed);
+        if let Some(port) = choose_board(wanted_port.as_deref()) {
+            match Board::open(&port) {
+                Ok(mut board) => {
+                    println!("Connected to the board on {port}");
+                    if serve(&mut board, &rx, &link_up).is_err() {
+                        return; // the input side is gone: we are exiting
+                    }
+                    println!("Lost the board on {port}; waiting for it to come back...");
+                }
+                Err(e) => println!("Could not open {port}: {e}"),
             }
-        };
-        match Board::open(&port) {
-            Ok(mut board) => {
-                println!("Connected to the board on {port}");
-                report_until_error(&mut board);
-                println!("Lost the board on {port}; waiting for it to come back...");
-            }
-            Err(e) => println!("Could not open {port}: {e}"),
         }
+        link_up.store(false, Ordering::Relaxed);
+        // Drop input that piled up while there was no board.
+        while rx.try_recv().is_ok() {}
         sleep(POLL_INTERVAL);
+    }
+}
+
+/// Forwards events until the board stops answering (Ok) or the input
+/// thread is gone (Err).
+fn serve(board: &mut Board, rx: &Receiver<Event>, link_up: &AtomicBool) -> Result<(), ()> {
+    let mut last_poll = Instant::now() - POLL_INTERVAL;
+    let mut last_status = Instant::now();
+    let mut last_link: Option<bool> = None;
+    loop {
+        if last_poll.elapsed() >= POLL_INTERVAL {
+            last_poll = Instant::now();
+            match board.request_stats(Duration::from_secs(1)) {
+                Ok(s) => {
+                    link_up.store(s.link_up, Ordering::Relaxed);
+                    if last_link != Some(s.link_up) || last_status.elapsed() >= STATUS_INTERVAL {
+                        last_link = Some(s.link_up);
+                        last_status = Instant::now();
+                        println!(
+                            "[link] {} @ {} | session {} | sent {} (resent {}, gave up {}) | frames failed {}/{}",
+                            if s.link_up { "UP" } else { "DOWN" },
+                            protocol::phy_rate_name(s.phy_rate),
+                            s.session,
+                            s.radio_sent,
+                            s.radio_retransmits,
+                            s.radio_gave_up,
+                            s.frames_failed,
+                            s.frames_acked + s.frames_failed,
+                        );
+                    }
+                }
+                Err(e) => {
+                    println!("Board error: {e}");
+                    return Ok(());
+                }
+            }
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(event) => {
+                if let Err(e) = send_event(board, event) {
+                    println!("Board error: {e}");
+                    return Ok(());
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(()),
+        }
+    }
+}
+
+/// Encodes one input event as a protocol packet (little-endian fields).
+fn send_event(board: &mut Board, event: Event) -> std::io::Result<()> {
+    match event {
+        Event::Key { usage, down, modifiers } => {
+            board.send(if down { msg::KEY_DOWN } else { msg::KEY_UP }, &[usage, modifiers])
+        }
+        Event::Mouse { dx, dy, buttons } => {
+            let clamp = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let mut p = Vec::with_capacity(5);
+            p.extend_from_slice(&clamp(dx).to_le_bytes());
+            p.extend_from_slice(&clamp(dy).to_le_bytes());
+            p.push(buttons);
+            board.send(msg::MOUSE_MOVE, &p)
+        }
+        Event::Scroll { vertical, horizontal } => {
+            let mut p = Vec::with_capacity(4);
+            p.extend_from_slice(&vertical.to_le_bytes());
+            p.extend_from_slice(&horizontal.to_le_bytes());
+            board.send(msg::MOUSE_SCROLL, &p)
+        }
+        Event::ModifierSync(modifiers) => board.send(msg::MODIFIER_SYNC, &[modifiers]),
     }
 }
 
@@ -62,34 +158,5 @@ fn choose_board(wanted: Option<&str>) -> Option<String> {
             println!("Several boards found: {}. Pass the port to use, e.g. `omni-kvm COM9`.", list.join(", "));
             None
         }
-    }
-}
-
-/// Prints the board's link state every POLL_INTERVAL until the board stops answering.
-fn report_until_error(board: &mut Board) {
-    loop {
-        match board.request_stats(Duration::from_secs(1)) {
-            Ok(s) => println!(
-                "link {} @ {} | session {} | input from this PC {} (dropped {}, resent {}, gave up {}) | \
-                 from peer {} | frames acked {} failed {} | auth failures {} | replays {}",
-                if s.link_up { "UP" } else { "DOWN" },
-                protocol::phy_rate_name(s.phy_rate),
-                s.session,
-                s.host_received,
-                s.host_dropped,
-                s.radio_retransmits,
-                s.radio_gave_up,
-                s.radio_received,
-                s.frames_acked,
-                s.frames_failed,
-                s.auth_failures,
-                s.replays_dropped,
-            ),
-            Err(e) => {
-                println!("Board error: {e}");
-                return;
-            }
-        }
-        sleep(POLL_INTERVAL);
     }
 }

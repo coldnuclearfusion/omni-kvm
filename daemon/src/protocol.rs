@@ -10,7 +10,6 @@ pub const PACKET_SIZE: usize = 64;
 pub const HEADER_SIZE: usize = 8;
 
 /// Message types used by the daemon (see protocol.md for the full list).
-#[allow(dead_code)] // the input messages are used once input forwarding lands (step 2)
 pub mod msg {
     pub const MOUSE_MOVE: u8 = 0x01;
     pub const MOUSE_SCROLL: u8 = 0x02;
