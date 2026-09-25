@@ -1,22 +1,28 @@
 //! Omni-KVM host daemon.
 //!
-//! Phase 3, step 2: capture this PC's keyboard and mouse (Windows) and,
-//! while the pointer is "on the Mac", forward them to the local board,
-//! which relays them over the radio to the board plugged into the Mac.
+//! On Windows (Phase 3): capture this PC's keyboard and mouse and, while
+//! the pointer is "on the Mac", forward them to the local board, which
+//! relays them over the radio to the board plugged into the Mac.
+//!
+//! On macOS (Phase 4, step 1): connect to the local board and report the
+//! link. Input capture on the Mac comes next.
 
 mod board;
+mod input;
+#[cfg(windows)]
 mod input_windows;
+#[cfg(windows)]
 mod keymap;
 mod protocol;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use board::Board;
-use input_windows::Event;
+use input::Event;
 use protocol::msg;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -24,7 +30,7 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 fn main() {
     println!("Omni-KVM daemon {}", env!("CARGO_PKG_VERSION"));
-    // Optional argument: the board's COM port, needed only when several
+    // Optional argument: the board's serial port, needed only when several
     // boards are plugged into this computer (e.g. during development).
     let wanted_port = std::env::args().nth(1);
 
@@ -34,10 +40,25 @@ fn main() {
         let link_up = link_up.clone();
         thread::spawn(move || board_loop(rx, link_up, wanted_port));
     }
+    capture_input(tx, link_up);
+}
+
+#[cfg(windows)]
+fn capture_input(tx: Sender<Event>, link_up: Arc<AtomicBool>) {
     // The hooks must live on a thread that pumps messages: this one.
     if let Err(e) = input_windows::run(tx, link_up) {
         eprintln!("Input capture failed: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn capture_input(tx: Sender<Event>, _link_up: Arc<AtomicBool>) {
+    // No input capture on this OS yet: only the board thread works.
+    // Holding `tx` keeps it running (it stops once no sender is left).
+    let _tx = tx;
+    loop {
+        thread::park();
     }
 }
 
@@ -155,7 +176,7 @@ fn choose_board(wanted: Option<&str>) -> Option<String> {
                 .iter()
                 .map(|b| format!("{} (serial {})", b.port, b.serial.as_deref().unwrap_or("?")))
                 .collect();
-            println!("Several boards found: {}. Pass the port to use, e.g. `omni-kvm COM9`.", list.join(", "));
+            println!("Several boards found: {}. Pass the port to use, e.g. `omni-kvm {}`.", list.join(", "), several[0].port);
             None
         }
     }

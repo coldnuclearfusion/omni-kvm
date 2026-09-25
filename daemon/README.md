@@ -2,7 +2,8 @@
 
 Host-side program (Rust). It talks to the board plugged into this computer
 over USB (the board's "USB" port, a CDC serial port) and, on Windows,
-captures the keyboard and mouse to control the other computer.
+captures the keyboard and mouse to control the other computer. On macOS
+it currently connects to the board and reports the link (Phase 4, step 1).
 
 ## Build and run (Windows)
 
@@ -11,6 +12,20 @@ cargo build --release
 target\release\omni-kvm.exe          # finds the board by itself
 target\release\omni-kvm.exe COM9     # or name the port, if several boards are plugged in
 ```
+
+## Build and run (macOS)
+
+Needs the Xcode command line tools (their linker) and Rust from
+[rustup](https://rustup.rs).
+
+```
+cargo build --release
+./target/release/omni-kvm                                  # finds the board by itself
+./target/release/omni-kvm /dev/cu.usbmodemE8F60A8DB00C2    # or name the port
+```
+
+macOS lists each serial device twice, as `/dev/cu.*` and `/dev/tty.*`;
+the daemon uses the `cu.` one. The name ends with the board's MAC address.
 
 ## Using it (Phase 3)
 

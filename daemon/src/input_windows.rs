@@ -30,16 +30,8 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::input::Event;
 use crate::keymap;
-
-/// What the capture side asks the board to send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
-    Key { usage: u8, down: bool, modifiers: u8 },
-    Mouse { dx: i32, dy: i32, buttons: u8 },
-    Scroll { vertical: i16, horizontal: i16 },
-    ModifierSync(u8),
-}
 
 /// Raw mouse counts pushed against the right edge before switching.
 const EDGE_RESISTANCE: i32 = 60;

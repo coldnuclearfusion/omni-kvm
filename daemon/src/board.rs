@@ -13,6 +13,7 @@ pub const ESPRESSIF_VID: u16 = 0x303A;
 /// A board's CDC port as found on this computer.
 #[derive(Debug, Clone)]
 pub struct Found {
+    /// e.g. "COM9" on Windows, "/dev/cu.usbmodemE8F60A8DB00C2" on macOS.
     pub port: String,
     /// USB serial number: the board's MAC address, e.g. "907069353188".
     pub serial: Option<String>,
@@ -23,6 +24,10 @@ pub fn find() -> Vec<Found> {
     let ports = serialport::available_ports().unwrap_or_default();
     ports
         .into_iter()
+        // macOS lists each serial device twice: /dev/cu.* ("call-out") and
+        // /dev/tty.* ("dial-in", whose open can wait for a modem carrier).
+        // Programs that start the conversation, like this one, use cu.*.
+        .filter(|p| !(cfg!(target_os = "macos") && p.port_name.starts_with("/dev/tty.")))
         .filter_map(|p| match p.port_type {
             SerialPortType::UsbPort(usb) if usb.vid == ESPRESSIF_VID => Some(Found {
                 port: p.port_name,
