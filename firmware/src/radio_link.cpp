@@ -16,7 +16,18 @@ static const uint8_t RADIO_CHANNEL = 1;             // both boards must match
 static const uint32_t HEARTBEAT_INTERVAL_MS = 100;
 static const uint32_t LINK_TIMEOUT_MS = 3000;       // 30 missed heartbeats
 static const uint32_t STATS_INTERVAL_MS = 2000;
+static const size_t RX_QUEUE_LEN = 32;
+static const size_t TX_QUEUE_LEN = 64;
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+static PacketHandler inputHandler = nullptr;
+
+// Input packets waiting to go out. ESP-NOW only buffers a few packets
+// itself and refuses more (ESP_ERR_ESPNOW_NO_MEM) when sent in a burst,
+// so we keep them here and retry on the next loop pass.
+static uint8_t txQueue[TX_QUEUE_LEN][proto::PACKET_SIZE];
+static size_t txHead = 0;
+static size_t txCount = 0;
 
 // ESP-NOW calls onReceive() from the Wi-Fi task, which runs at the same
 // time as loop(). onReceive() only copies the packet into this queue;
@@ -37,6 +48,9 @@ static bool wasLinkUp = false;
 struct Stats {
     uint32_t heartbeatsSent = 0;
     uint32_t heartbeatsReceived = 0;
+    uint32_t inputSent = 0;
+    uint32_t inputReceived = 0;
+    uint32_t inputRetries = 0;
     uint32_t rttCount = 0;
     uint32_t rttSumUs = 0;
     uint32_t rttMinUs = UINT32_MAX;
@@ -68,12 +82,35 @@ static void addPeer(const uint8_t *mac) {
     esp_now_add_peer(&peer);
 }
 
+// Stamps our radio sequence number into the packet and hands it to ESP-NOW.
+static esp_err_t transmit(const uint8_t *mac, uint8_t *packet) {
+    uint32_t seq = txSeq + 1;
+    memcpy(packet + offsetof(proto::Header, seq), &seq, sizeof(seq));
+    esp_err_t result = esp_now_send(mac, packet, proto::PACKET_SIZE);
+    if (result == ESP_OK) txSeq = seq;
+    return result;
+}
+
 static void send(const uint8_t *mac, uint8_t msgType, const void *payload, size_t len) {
     uint8_t packet[proto::PACKET_SIZE] = {};
-    proto::Header header = {proto::MAGIC, proto::VERSION, msgType, 0, ++txSeq};
+    proto::Header header = {proto::MAGIC, proto::VERSION, msgType, 0, 0};
     memcpy(packet, &header, sizeof(header));
     memcpy(packet + proto::HEADER_SIZE, payload, len);
-    esp_now_send(mac, packet, sizeof(packet));
+    transmit(mac, packet);
+}
+
+// Sends queued input packets until ESP-NOW's own buffer is full.
+static void flushTxQueue() {
+    while (txCount > 0) {
+        esp_err_t result = transmit(peerMac, txQueue[txHead]);
+        if (result == ESP_ERR_ESPNOW_NO_MEM) {
+            stats.inputRetries++;
+            return;                 // ESP-NOW is busy; try again next pass
+        }
+        if (result == ESP_OK) stats.inputSent++;
+        txHead = (txHead + 1) % TX_QUEUE_LEN;
+        txCount--;
+    }
 }
 
 static void handle(const Received &r) {
@@ -90,6 +127,12 @@ static void handle(const Received &r) {
     }
     if (memcmp(r.mac, peerMac, sizeof(peerMac)) != 0) return;   // not our peer
     lastHeardMs = millis();
+
+    if (proto::isInputMessage(header.msg_type)) {
+        stats.inputReceived++;
+        if (inputHandler) inputHandler(r.data);
+        return;
+    }
 
     proto::Heartbeat hb;
     memcpy(&hb, r.data + proto::HEADER_SIZE, sizeof(hb));
@@ -122,11 +165,16 @@ static void printStats() {
                       macToString(peerMac).c_str(), stats.heartbeatsSent, stats.heartbeatsReceived,
                       stats.rttMinUs, stats.rttSumUs / stats.rttCount, stats.rttMaxUs);
     }
+    if (stats.inputSent || stats.inputReceived || stats.inputRetries) {
+        Serial.printf("[radio] input sent %u (retries %u), received %u\n",
+                      stats.inputSent, stats.inputRetries, stats.inputReceived);
+    }
     stats = Stats();
 }
 
-void begin() {
-    rxQueue = xQueueCreate(16, sizeof(Received));
+void begin(PacketHandler onInput) {
+    inputHandler = onInput;
+    rxQueue = xQueueCreate(RX_QUEUE_LEN, sizeof(Received));
 
     // ESP-NOW needs the Wi-Fi radio running in station mode, but we never
     // join a network: no WiFi.begin(), no auto-reconnect (which would call
@@ -164,6 +212,8 @@ void update() {
         stats.heartbeatsSent++;
     }
 
+    flushTxQueue();
+
     bool linkUp = isLinkUp();
     if (linkUp != wasLinkUp) {
         Serial.println(linkUp ? "[radio] link UP" : "[radio] link DOWN");
@@ -179,6 +229,13 @@ void update() {
 
 bool isLinkUp() {
     return havePeer && millis() - lastHeardMs < LINK_TIMEOUT_MS;
+}
+
+bool sendToPeer(const uint8_t *packet) {
+    if (!isLinkUp() || txCount == TX_QUEUE_LEN) return false;
+    memcpy(txQueue[(txHead + txCount) % TX_QUEUE_LEN], packet, proto::PACKET_SIZE);
+    txCount++;
+    return true;
 }
 
 }  // namespace radio_link

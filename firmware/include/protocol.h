@@ -45,6 +45,12 @@ enum MsgType : uint8_t {
     MSG_DFU_ENTER        = 0xFF,
 };
 
+// Keyboard/mouse input: forwarded from the active side to the peer
+// and injected there as HID reports.
+inline bool isInputMessage(uint8_t msgType) {
+    return msgType >= MSG_MOUSE_MOVE && msgType <= MSG_MODIFIER_SYNC;
+}
+
 // Header flags (bits 3–7 are reserved and must be 0)
 constexpr uint8_t FLAG_ACK_REQUESTED = 1 << 0;
 constexpr uint8_t FLAG_IS_ACK        = 1 << 1;

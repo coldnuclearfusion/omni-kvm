@@ -1,8 +1,9 @@
 """Send Omni-KVM protocol packets to a board over its USB serial port.
 
-Phase 1 test tool. The board handles these packets as if they came
-from its peer over the radio, so this exercises the firmware's packet
-parsing and HID output without a second board or a host daemon.
+Stands in for the host daemon. The board forwards these packets to its
+peer over the radio, and the peer types / moves the mouse on its own
+host. With both boards plugged into one PC, pass --port for the board
+that should send; the other one does the typing.
 
 Usage (needs pyserial; PlatformIO's Python already has it):
     python tools/hid_test.py type "Hello from Omni-KVM!"
@@ -77,10 +78,11 @@ class Link:
 
 
 def find_board_port():
-    ports = [p.device for p in list_ports.comports() if p.vid == ESPRESSIF_VID]
+    ports = [p for p in list_ports.comports() if p.vid == ESPRESSIF_VID]
     if len(ports) != 1:
-        sys.exit(f"Expected one Omni-KVM USB port, found {ports or 'none'}. Use --port.")
-    return ports[0]
+        found = ", ".join(f"{p.device} (serial {p.serial_number})" for p in ports) or "none"
+        sys.exit(f"Expected one Omni-KVM USB port, found: {found}. Use --port.")
+    return ports[0].device
 
 
 def wait_for_notepad(timeout_s=300):

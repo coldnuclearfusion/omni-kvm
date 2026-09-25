@@ -1,19 +1,18 @@
 // ============================================================
 // Omni-KVM Firmware — Phase 2 (in progress): radio link
 // ============================================================
-// Phase 2: The two boards find each other over ESP-NOW and exchange
-//          heartbeats (radio_link). LED: green = alone, blue = linked.
+// The "USB" port is a composite device: HID keyboard + mouse, plus a
+// CDC serial channel for the host daemon. Both boards run this same
+// firmware:
 //
-// Phase 1: The "USB" port is a composite device: HID keyboard +
-//          mouse, plus a CDC serial channel. 64-byte protocol
-//          packets (shared/protocol.md) arriving on the CDC channel
-//          are turned into keyboard/mouse input on the same host.
+//   host ──CDC──▶ this board ══ESP-NOW══▶ peer board ──HID──▶ peer's host
 //
-//          In the final design the CDC channel belongs to the host
-//          daemon and input packets come from the peer board over
-//          the radio. For now the PC sends input packets itself
-//          (tools/hid_test.py) and the board handles them as if
-//          they came from the radio.
+// Input packets (shared/protocol.md) from the host are forwarded to
+// the peer over the radio; input packets from the peer are injected
+// into this board's host as keyboard/mouse reports. Until the daemon
+// exists, tools/hid_test.py plays the host's part.
+//
+// LED: green = no peer, blue = radio link up.
 //
 // Cables:  "UART" port -> PC (upload + debug log)
 //          "USB"  port -> the computer to control (can be the same PC)
@@ -37,11 +36,13 @@ static const size_t DAEMON_RX_BUFFER = 4096;
 // CDC serial channel on the "USB" port (shows up as a COM port).
 USBCDC DaemonSerial;
 
-static uint32_t packetsReceived = 0;
+static uint32_t packetsFromHost = 0;
+static uint32_t packetsForwarded = 0;
+static uint32_t packetsDropped = 0;
 
 // ── Heartbeat LED (non-blocking) ──────────────────────────
 // Blinks every BLINK_INTERVAL_MS: blue while the radio link is up,
-// green otherwise. Also reports how many packets arrived from the PC.
+// green otherwise. Also reports what happened to packets from the host.
 static void updateHeartbeat() {
     static uint32_t lastToggle = 0;
     static bool ledOn = false;
@@ -59,16 +60,16 @@ static void updateHeartbeat() {
         neopixelWrite(LED_PIN, 0, level, 0);
     }
 
-    if (packetsReceived != packetsReported) {
-        Serial.printf("[link] %u packets received so far\n", packetsReceived);
-        packetsReported = packetsReceived;
+    if (packetsFromHost != packetsReported) {
+        Serial.printf("[host] packets so far: %u received, %u forwarded, %u dropped\n",
+                      packetsFromHost, packetsForwarded, packetsDropped);
+        packetsReported = packetsFromHost;
     }
 }
 
-// ── Packet handling ───────────────────────────────────────
-// Replay protection (sequence numbers) belongs to the radio path and
-// arrives in Phase 2. The CDC channel is a cable to the trusted host.
-static void handlePacket(const uint8_t *raw) {
+// ── Input from the peer → this host ───────────────────────
+// Called by radio_link for each input packet the peer sends us.
+static void injectInput(const uint8_t *raw) {
     proto::Header header;
     memcpy(&header, raw, sizeof(header));
     const uint8_t *payload = raw + proto::HEADER_SIZE;
@@ -114,8 +115,24 @@ static void handlePacket(const uint8_t *raw) {
             break;
         }
         default:
-            Serial.printf("[link] ignored msg_type 0x%02X\n", header.msg_type);
             break;
+    }
+}
+
+// ── Input from this host → the peer ───────────────────────
+static void forwardFromHost(const uint8_t *raw) {
+    proto::Header header;
+    memcpy(&header, raw, sizeof(header));
+
+    if (header.version != proto::VERSION || !proto::isInputMessage(header.msg_type)) {
+        Serial.printf("[host] ignored packet: version 0x%02X, msg_type 0x%02X\n",
+                      header.version, header.msg_type);
+        return;
+    }
+    if (radio_link::sendToPeer(raw)) {
+        packetsForwarded++;
+    } else {
+        packetsDropped++;       // no radio link, or the send queue is full
     }
 }
 
@@ -133,8 +150,8 @@ static void pollDaemonLink() {
 
         buffer[length++] = b;
         if (length == proto::PACKET_SIZE) {
-            packetsReceived++;
-            handlePacket(buffer);
+            packetsFromHost++;
+            forwardFromHost(buffer);
             length = 0;
         }
     }
@@ -159,14 +176,14 @@ void setup() {
     USB.manufacturerName("Omni-KVM Project");
     USB.begin();
 
-    radio_link::begin();
+    radio_link::begin(injectInput);
 
     Serial.println("========================================");
     Serial.println("  Omni-KVM Firmware v0.2.0-dev (Phase 2)");
     Serial.println("  Board: ESP32-S3-DevKitC-1-N8R8");
     Serial.println("========================================");
     Serial.println();
-    Serial.println("Waiting for protocol packets on the USB port.");
+    Serial.println("Forwarding host input to the peer over ESP-NOW.");
     Serial.println();
 }
 
