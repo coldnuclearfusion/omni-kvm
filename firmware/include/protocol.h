@@ -56,6 +56,12 @@ constexpr uint8_t FLAG_ACK_REQUESTED = 1 << 0;
 constexpr uint8_t FLAG_IS_ACK        = 1 << 1;
 constexpr uint8_t FLAG_ENCRYPTED     = 1 << 2;
 
+// Sealed (encrypted) radio packets — see shared/protocol.md "Encryption":
+//   header(8) | nonce(12) | ciphertext(28) | tag(16)
+constexpr size_t NONCE_SIZE = 12;
+constexpr size_t TAG_SIZE = 16;
+constexpr size_t SEALED_DATA_SIZE = PAYLOAD_SIZE - NONCE_SIZE - TAG_SIZE;   // 28
+
 // "packed" tells the compiler not to insert padding bytes between
 // fields, so the struct matches the byte layout in protocol.md.
 struct __attribute__((packed)) Header {

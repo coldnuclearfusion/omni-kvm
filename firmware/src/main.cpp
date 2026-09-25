@@ -68,20 +68,12 @@ static void updateHeartbeat() {
 }
 
 // ── Input from the peer → this host ───────────────────────
-// Called by radio_link for each input packet the peer sends us.
+// Called by radio_link for each input packet the peer sends us. By
+// then radio_link has verified, decrypted, and replay-checked it.
 static void injectInput(const uint8_t *raw) {
     proto::Header header;
     memcpy(&header, raw, sizeof(header));
     const uint8_t *payload = raw + proto::HEADER_SIZE;
-
-    if (header.version != proto::VERSION) {
-        Serial.printf("[link] dropped packet: version 0x%02X\n", header.version);
-        return;
-    }
-    if (header.flags & proto::FLAG_ENCRYPTED) {
-        Serial.println("[link] dropped packet: encryption not supported yet");
-        return;
-    }
 
     switch (header.msg_type) {
         case proto::MSG_KEY_DOWN: {

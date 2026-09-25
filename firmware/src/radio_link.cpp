@@ -9,6 +9,13 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "protocol.h"
+#include "secure_packet.h"
+
+#if __has_include("secrets/dev_key.h")
+#include "secrets/dev_key.h"
+#else
+#error "No radio key. Run: python tools/make_dev_key.py (then flash both boards)"
+#endif
 
 namespace radio_link {
 
@@ -42,6 +49,7 @@ static uint32_t txSeq = 0;
 static bool havePeer = false;
 static uint8_t peerMac[6];
 static uint32_t lastHeardMs = 0;
+static uint32_t lastPeerSeq = 0;    // highest seq accepted from the peer
 static bool wasLinkUp = false;
 
 // Counters since the last stats line
@@ -55,6 +63,12 @@ struct Stats {
     uint32_t rttSumUs = 0;
     uint32_t rttMinUs = UINT32_MAX;
     uint32_t rttMaxUs = 0;
+    uint32_t authFailures = 0;      // packets whose tag didn't verify
+    uint32_t replaysDropped = 0;    // authentic packets with an old seq
+    uint32_t sealCount = 0;
+    uint32_t sealSumUs = 0;
+    uint32_t openCount = 0;
+    uint32_t openSumUs = 0;
 };
 static Stats stats;
 
@@ -78,15 +92,25 @@ static void addPeer(const uint8_t *mac) {
     memcpy(peer.peer_addr, mac, sizeof(peer.peer_addr));
     peer.channel = 0;               // 0 = the channel we are already on
     peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;           // encryption comes in a later step
+    peer.encrypt = false;           // we encrypt ourselves (secure_packet), not ESP-NOW
     esp_now_add_peer(&peer);
 }
 
-// Stamps our radio sequence number into the packet and hands it to ESP-NOW.
-static esp_err_t transmit(const uint8_t *mac, uint8_t *packet) {
+// Stamps our radio sequence number into a copy of the packet, seals it,
+// and hands it to ESP-NOW. The caller's packet stays plaintext so it can
+// be retried.
+static esp_err_t transmit(const uint8_t *mac, const uint8_t *packet) {
+    uint8_t sealed[proto::PACKET_SIZE];
+    memcpy(sealed, packet, sizeof(sealed));
     uint32_t seq = txSeq + 1;
-    memcpy(packet + offsetof(proto::Header, seq), &seq, sizeof(seq));
-    esp_err_t result = esp_now_send(mac, packet, proto::PACKET_SIZE);
+    memcpy(sealed + offsetof(proto::Header, seq), &seq, sizeof(seq));
+
+    uint32_t start = micros();
+    if (!secure_packet::seal(sealed)) return ESP_ERR_INVALID_ARG;
+    stats.sealSumUs += micros() - start;
+    stats.sealCount++;
+
+    esp_err_t result = esp_now_send(mac, sealed, sizeof(sealed));
     if (result == ESP_OK) txSeq = seq;
     return result;
 }
@@ -113,11 +137,23 @@ static void flushTxQueue() {
     }
 }
 
-static void handle(const Received &r) {
+static void handle(Received &r) {
+    // Once we have a peer, ignore everyone else before spending time on crypto.
+    if (havePeer && memcmp(r.mac, peerMac, sizeof(peerMac)) != 0) return;
+
+    uint32_t start = micros();
+    if (!secure_packet::open(r.data)) {
+        stats.authFailures++;       // altered, corrupted, or a different key
+        return;
+    }
+    stats.openSumUs += micros() - start;
+    stats.openCount++;
+
     proto::Header header;
     memcpy(&header, r.data, sizeof(header));
     if (header.version != proto::VERSION) return;
 
+    // Only a board holding the same key can become our peer.
     if (!havePeer) {
         if (header.msg_type != proto::MSG_HEARTBEAT) return;
         memcpy(peerMac, r.mac, sizeof(peerMac));
@@ -125,7 +161,17 @@ static void handle(const Received &r) {
         addPeer(peerMac);
         Serial.printf("[radio] peer found: %s\n", macToString(peerMac).c_str());
     }
-    if (memcmp(r.mac, peerMac, sizeof(peerMac)) != 0) return;   // not our peer
+
+    // Replay protection: the peer's seq only goes up, so an authentic
+    // packet with an old seq is a recording being played back. After the
+    // link has been down we accept the peer's seq afresh, because a
+    // rebooted peer starts counting from 1 again. (Weakness until session
+    // keys arrive: see docs/security.md, "Replay protection".)
+    if (isLinkUp() && header.seq <= lastPeerSeq) {
+        stats.replaysDropped++;
+        return;
+    }
+    lastPeerSeq = header.seq;
     lastHeardMs = millis();
 
     if (proto::isInputMessage(header.msg_type)) {
@@ -169,6 +215,10 @@ static void printStats() {
         Serial.printf("[radio] input sent %u (retries %u), received %u\n",
                       stats.inputSent, stats.inputRetries, stats.inputReceived);
     }
+    Serial.printf("[radio] crypto: seal avg %u us, open avg %u us | auth failures %u, replays dropped %u\n",
+                  stats.sealCount ? stats.sealSumUs / stats.sealCount : 0,
+                  stats.openCount ? stats.openSumUs / stats.openCount : 0,
+                  stats.authFailures, stats.replaysDropped);
     stats = Stats();
 }
 
@@ -189,6 +239,7 @@ void begin(PacketHandler onInput) {
         Serial.println("[radio] ESP-NOW init failed");
         return;
     }
+    secure_packet::begin(DEV_RADIO_KEY);   // Wi-Fi is on, so the RNG is truly random
     esp_now_register_recv_cb(onReceive);
     addPeer(BROADCAST_MAC);   // heartbeats go to everyone until we know our peer
 
