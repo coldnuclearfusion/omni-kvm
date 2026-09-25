@@ -222,14 +222,18 @@ Offset  Size  Field       Description
 ──────  ────  ──────────  ────────────────────────────────────────
 8       1     cmd_id      Sub-command:
                           0x01 = request peer MAC address
-                          0x02 = set encryption key (16 bytes follow)
+                          0x02 = (reserved, see note) set encryption key
                           0x03 = request firmware version
-                          0x04 = request link statistics
-                          0x05 = trigger pairing mode
+                          0x04 = request link statistics → MSG_DAEMON_STATUS 0x03
+                          0x05 = (reserved, see note) trigger pairing mode
+                          0x06 = development: set radio TX window
+                                 (data[0] = most input frames in flight, 0 = no limit)
 9       55    (data)      Sub-command-specific data
 ```
 
 This is a local-only message (daemon ↔ its own firmware over USB CDC). It never goes over the radio.
+
+**Note on 0x02 and 0x05**: `docs/security.md` principle 5 says pairing can only be started by the physical button, never by a software command, so that a compromised host cannot silently pair the device with an attacker's. A host that can set the key (0x02) or start pairing (0x05) would break that. Both stay unimplemented until the pairing design (Phase 5) settles this.
 
 ### MSG_DAEMON_STATUS (0x41)
 
@@ -239,13 +243,39 @@ Offset  Size  Field       Description
 8       1     status_id   Sub-status:
                           0x01 = peer MAC address (6 bytes follow)
                           0x02 = firmware version (semver string, max 16 bytes)
-                          0x03 = link statistics (packet counts, avg RTT)
+                          0x03 = link statistics (layout below)
                           0x04 = pairing state change
                           0x05 = link up / link down event
 9       55    (data)      Sub-status-specific data
 ```
 
 Also local-only (firmware → daemon over USB CDC).
+
+**Link statistics (status 0x03)**, counters since boot, little-endian (`proto::LinkStats` in `firmware/include/protocol.h`; `tools/hid_test.py stats` prints them):
+
+```
+Offset  Size  Field               Description
+──────  ────  ──────────────────  ────────────────────────────────────────
+8       1     status_id           0x03
+9       1     layout              Layout version of this block (currently 2)
+10      1     link_up             1 while the radio link is up
+11      4     session             Session generation (0 = none yet)
+15      4     host_received       Input packets from this board's host
+19      4     host_dropped        ...not queued for the radio (link down, queue full)
+23      4     radio_sent          Input packets handed to ESP-NOW
+27      4     radio_send_retries  ESP-NOW was busy; sent again later
+31      4     radio_received      Authentic input packets from the peer
+35      4     radio_rx_overflow   Radio packets lost: receive queue full
+39      4     auth_failures       Radio packets whose tag did not verify
+43      4     replays_dropped     Authentic packets with an old sequence number
+47      4     frames_sent         All radio frames accepted by ESP-NOW (incl. heartbeats)
+51      4     frames_acked        ...acknowledged by the peer at the MAC layer
+55      4     frames_failed       ...not acknowledged, even after MAC retries
+59      2     hid_stalls          Keyboard output had to wait for USB (saturates)
+63      2     hid_mouse_dropped   Mouse reports dropped, USB not ready (saturates)
+```
+
+Readers must check `layout` and refuse unknown values rather than misread the counters.
 
 ## Encryption
 
@@ -357,6 +387,12 @@ In practice, mouse reports will be batched: if multiple deltas accumulate betwee
 | 30 × 5-count reports, 8 ms apart | 123, 123, 123, 123 px | Yes, exactly |
 
 A few deltas summed within ~1 ms is harmless, since a real mouse reports at that rate anyway. But a backlog that builds up during a radio stall must be replayed as small steps over time, not summed into one jump.
+
+**Bursts from the host.** Measured in Phase 2 with the test tool sending a whole line of text (70–76 packets) or a mouse square (120 packets) at once, with the link statistics above read before and after:
+
+- A 64-packet radio send queue silently dropped the tail of a 70-packet burst (the last three characters). Fixed: the queue holds 128 packets and the firmware stops reading from USB while it is full, so a burst waits in the 4 KB USB receive buffer instead.
+- Over six runs (~1,600 input packets each way combined), one packet was lost in the air (reported by ESP-NOW as not acknowledged). Limiting frames in flight to 1 or 4 made no measurable difference, so the default is no limit. One earlier run lost 37 of 190 packets in one direction; it did not reproduce, and the new `frames_failed` / `radio_rx_overflow` counters will show where such losses happen if they recur.
+- Keystrokes are not yet retransmitted when ESP-NOW reports a failed frame; a lost key event means a missing or stuck key until the next event. Retransmitting key events (they are state-based, so a duplicate is harmless) is a candidate improvement.
 
 ## Radio settings
 
