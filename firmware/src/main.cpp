@@ -1,7 +1,10 @@
 // ============================================================
-// Omni-KVM Firmware — Phase 1: USB HID driven by protocol packets
+// Omni-KVM Firmware — Phase 2 (in progress): radio link
 // ============================================================
-// Purpose: The "USB" port is a composite device: HID keyboard +
+// Phase 2: The two boards find each other over ESP-NOW and exchange
+//          heartbeats (radio_link). LED: green = alone, blue = linked.
+//
+// Phase 1: The "USB" port is a composite device: HID keyboard +
 //          mouse, plus a CDC serial channel. 64-byte protocol
 //          packets (shared/protocol.md) arriving on the CDC channel
 //          are turned into keyboard/mouse input on the same host.
@@ -20,6 +23,7 @@
 #include "USB.h"
 #include "hid_output.h"
 #include "protocol.h"
+#include "radio_link.h"
 
 // The ESP32-S3-DevKitC-1 has a WS2812 RGB LED on GPIO 38.
 // (The PCB silkscreen labels this as "RGB@IO38".)
@@ -36,8 +40,8 @@ USBCDC DaemonSerial;
 static uint32_t packetsReceived = 0;
 
 // ── Heartbeat LED (non-blocking) ──────────────────────────
-// Toggles the LED every BLINK_INTERVAL_MS and, while at it, reports
-// how many packets arrived since the last report.
+// Blinks every BLINK_INTERVAL_MS: blue while the radio link is up,
+// green otherwise. Also reports how many packets arrived from the PC.
 static void updateHeartbeat() {
     static uint32_t lastToggle = 0;
     static bool ledOn = false;
@@ -48,7 +52,12 @@ static void updateHeartbeat() {
     lastToggle = now;
 
     ledOn = !ledOn;
-    neopixelWrite(LED_PIN, 0, ledOn ? 20 : 0, 0);
+    uint8_t level = ledOn ? 20 : 0;
+    if (radio_link::isLinkUp()) {
+        neopixelWrite(LED_PIN, 0, 0, level);
+    } else {
+        neopixelWrite(LED_PIN, 0, level, 0);
+    }
 
     if (packetsReceived != packetsReported) {
         Serial.printf("[link] %u packets received so far\n", packetsReceived);
@@ -150,8 +159,10 @@ void setup() {
     USB.manufacturerName("Omni-KVM Project");
     USB.begin();
 
+    radio_link::begin();
+
     Serial.println("========================================");
-    Serial.println("  Omni-KVM Firmware v0.1.0 (Phase 1)");
+    Serial.println("  Omni-KVM Firmware v0.2.0-dev (Phase 2)");
     Serial.println("  Board: ESP32-S3-DevKitC-1-N8R8");
     Serial.println("========================================");
     Serial.println();
@@ -166,4 +177,5 @@ void loop() {
     updateHeartbeat();
     pollDaemonLink();
     hid_output::update();
+    radio_link::update();
 }

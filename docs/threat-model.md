@@ -88,7 +88,7 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 - ESP32-S3 has been analyzed by multiple independent security researchers.
 - In March 2025, undocumented HCI commands were found in the ESP32 Bluetooth stack. Subsequent analysis determined these were debug/manufacturing commands, not remotely exploitable backdoors. Our project does not use Bluetooth.
 - No confirmed instance of data exfiltration via ESP32 hardware has been published.
-- Our firmware initializes Wi-Fi in ESP-NOW-only mode. Station mode (AP association) is never enabled. Even if a backdoor existed in the Wi-Fi stack, it would need to autonomously establish an internet connection through an unknown access point — a detectable and unlikely operation.
+- ESP-NOW requires the Wi-Fi radio to run in station mode, but our firmware never associates with an access point: it never calls `WiFi.begin()` (the only path to `esp_wifi_connect()`), turns off the Arduino library's auto-reconnect (which would otherwise call `WiFi.begin()` on a disconnect event), and erases any network credentials left in flash by earlier firmware. Even if a backdoor existed in the Wi-Fi stack, it would need to autonomously establish an internet connection through an unknown access point — a detectable and unlikely operation.
 
 **Mitigation**: Post-build verification. The user (or any reviewer) can monitor the device's radio emissions with a spectrum analyzer or packet sniffer to verify that only ESP-NOW traffic to the known peer MAC address is present.
 

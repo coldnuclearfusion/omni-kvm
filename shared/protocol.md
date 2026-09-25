@@ -176,14 +176,16 @@ If rejected (e.g. full-screen lock active on the receiving side), the sending da
 ```
 Offset  Size  Field       Description
 ──────  ────  ──────────  ────────────────────────────────────────
-8       4     timestamp   Local millisecond counter (uint32) — used to measure RTT
-12      1     link_quality RSSI or link quality metric (uint8, 0–100)
+8       4     timestamp   Local microsecond counter (uint32) — used to measure RTT
+12      1     link_quality RSSI or link quality metric (uint8, 0–100; 0 = not measured)
 13      51    (padding)   Zero-filled
 ```
 
 Heartbeat is sent by both sides every 100 ms. If 30 consecutive heartbeats are missed (3 seconds), the link is declared down.
 
-The timestamp field allows each side to compute round-trip time. It is not a synchronized clock — each side has its own epoch. RTT is measured by noting when a heartbeat was sent, and when the corresponding ACK returns.
+The timestamp field allows each side to compute round-trip time. It is not a synchronized clock — each side has its own epoch. The sender puts its own clock in `timestamp`; the peer's `MSG_HEARTBEAT_ACK` echoes that value back unchanged, so RTT = (sender's clock when the ACK arrives) − `timestamp`.
+
+The counter is in microseconds because the expected RTT (2–4 ms) is too short to measure meaningfully in milliseconds. A uint32 microsecond counter wraps every ~71.6 minutes; unsigned subtraction still gives the right difference across a wrap, and only differences are ever used.
 
 ### MSG_LOCK (0x50) / MSG_UNLOCK (0x51)
 

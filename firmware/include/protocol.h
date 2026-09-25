@@ -81,4 +81,11 @@ struct __attribute__((packed)) ModifierSync {
     uint8_t modifiers;
 };
 
+// Used by both MSG_HEARTBEAT and MSG_HEARTBEAT_ACK. The ACK echoes the
+// heartbeat's timestamp so the original sender can compute the RTT.
+struct __attribute__((packed)) Heartbeat {
+    uint32_t timestamp;     // sender's micros()
+    uint8_t link_quality;   // 0 = not measured
+};
+
 }  // namespace proto
