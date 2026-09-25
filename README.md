@@ -58,7 +58,7 @@ Wireless input is a sensitive channel. The threat model and mitigations are docu
 
 ## Roadmap
 
-- [ ] **Phase 0** — Wired proof-of-concept between two ESP32-S3 boards
+- [x] **Phase 0** — Development environment + hello-world firmware on both boards
 - [ ] **Phase 1** — USB HID composite device firmware
 - [ ] **Phase 2** — ESP-NOW wireless link with encryption
 - [ ] **Phase 3** — Windows host daemon + virtual resistance UX
