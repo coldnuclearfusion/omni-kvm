@@ -106,6 +106,37 @@ struct __attribute__((packed)) SessionHello {
 };
 static_assert(sizeof(SessionHello) <= SEALED_DATA_SIZE, "HELLO must fit in a sealed packet");
 
+// MSG_DAEMON_CMD / MSG_DAEMON_STATUS: between a host and its own board
+// over USB CDC only, never over the radio (so not limited to 28 bytes).
+constexpr uint8_t CMD_REQUEST_LINK_STATS = 0x04;
+constexpr uint8_t CMD_SET_TX_WINDOW = 0x06;     // development: data[0] = window (0 = no limit)
+constexpr uint8_t STATUS_LINK_STATS = 0x03;
+constexpr uint8_t LINK_STATS_LAYOUT = 2;        // bump whenever LinkStats changes
+
+// Counters since boot. "host_*" are input packets from this board's host;
+// "radio_*" are input packets over the radio.
+struct __attribute__((packed)) LinkStats {
+    uint8_t status_id;              // STATUS_LINK_STATS
+    uint8_t layout;                 // LINK_STATS_LAYOUT, so readers can detect a mismatch
+    uint8_t link_up;
+    uint32_t session;               // session generation (0 = none yet)
+    uint32_t host_received;
+    uint32_t host_dropped;          // not queued for the radio: link down, or queue full
+    uint32_t radio_sent;            // handed to ESP-NOW
+    uint32_t radio_send_retries;    // ESP-NOW was busy; sent again later
+    uint32_t radio_received;        // authentic input packets from the peer
+    uint32_t radio_rx_overflow;     // any packet dropped because the receive queue was full
+    uint32_t auth_failures;
+    uint32_t replays_dropped;
+    uint32_t frames_sent;           // every radio frame accepted by ESP-NOW (heartbeats too)
+    uint32_t frames_acked;          // ...confirmed delivered at the MAC layer
+    uint32_t frames_failed;         // ...not acknowledged, even after MAC retries
+    uint16_t hid_stalls;            // keyboard output had to wait for USB (saturates)
+    uint16_t hid_mouse_dropped;     // mouse reports dropped, USB not ready (saturates)
+};
+static_assert(sizeof(LinkStats) <= PAYLOAD_SIZE, "LinkStats must fit in a packet");
+static_assert(sizeof(LinkStats) == 55, "Layout changed: bump LINK_STATS_LAYOUT and update tools/hid_test.py");
+
 // Used by both MSG_HEARTBEAT and MSG_HEARTBEAT_ACK. The ACK echoes the
 // heartbeat's timestamp so the original sender can compute the RTT.
 struct __attribute__((packed)) Heartbeat {

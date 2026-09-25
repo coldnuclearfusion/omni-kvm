@@ -4,6 +4,7 @@
 
 #include "radio_link.h"
 
+#include <atomic>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -39,7 +40,7 @@ static const uint32_t HEARTBEAT_INTERVAL_MS = 100;   // also the HELLO interval
 static const uint32_t LINK_TIMEOUT_MS = 3000;        // 30 missed heartbeats
 static const uint32_t STATS_INTERVAL_MS = 2000;
 static const size_t RX_QUEUE_LEN = 32;
-static const size_t TX_QUEUE_LEN = 64;
+static const size_t TX_QUEUE_LEN = 128;
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static PacketHandler inputHandler = nullptr;
@@ -91,6 +92,29 @@ struct Stats {
 };
 static Stats stats;
 
+// Counters since boot, reported to the host (totals()). The atomics are
+// shared with the Wi-Fi task: each is written by only one side.
+static Totals total;
+static std::atomic<uint32_t> rxOverflow{0};     // written in onReceive (Wi-Fi task)
+static std::atomic<uint32_t> framesSent{0};     // written in transmit() (loop)
+static std::atomic<uint32_t> framesAcked{0};    // written in onSent (Wi-Fi task)
+static std::atomic<uint32_t> framesFailed{0};   // written in onSent (Wi-Fi task)
+static uint8_t txWindow = 0;                    // 0 = no limit
+
+// ESP-NOW reports the fate of every frame: delivered (acknowledged by the
+// receiver at the MAC layer) or failed after its automatic retries.
+static void onSent(const uint8_t *mac, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        framesAcked++;
+    } else {
+        framesFailed++;
+    }
+}
+
+static uint32_t framesInFlight() {
+    return framesSent - framesAcked - framesFailed;
+}
+
 static String macToString(const uint8_t *mac) {
     char s[18];
     snprintf(s, sizeof(s), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -103,7 +127,9 @@ static void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
     Received r;
     memcpy(r.mac, mac, sizeof(r.mac));
     memcpy(r.data, data, sizeof(r.data));
-    xQueueSend(rxQueue, &r, 0);     // if the queue is full, drop it
+    if (xQueueSend(rxQueue, &r, 0) != pdTRUE) {
+        rxOverflow++;               // queue full: the packet is lost
+    }
 }
 
 static void addPeer(const uint8_t *mac, bool isBroadcast = false) {
@@ -145,7 +171,10 @@ static esp_err_t transmit(const uint8_t *mac, const uint8_t *packet) {
     stats.sealCount++;
 
     esp_err_t result = esp_now_send(mac, sealed, sizeof(sealed));
-    if (result == ESP_OK) txSeq = seq;
+    if (result == ESP_OK) {
+        txSeq = seq;
+        framesSent++;
+    }
     return result;
 }
 
@@ -160,12 +189,17 @@ static void send(const uint8_t *mac, uint8_t msgType, const void *payload, size_
 // Sends queued input packets until ESP-NOW's own buffer is full.
 static void flushTxQueue() {
     while (txCount > 0 && session::isUp()) {
+        if (txWindow != 0 && framesInFlight() >= txWindow) return;   // wait for delivery reports
         esp_err_t result = transmit(peerMac, txQueue[txHead]);
         if (result == ESP_ERR_ESPNOW_NO_MEM) {
             stats.inputRetries++;
+            total.inputRetries++;
             return;                 // ESP-NOW is busy; try again next pass
         }
-        if (result == ESP_OK) stats.inputSent++;
+        if (result == ESP_OK) {
+            stats.inputSent++;
+            total.inputSent++;
+        }
         txHead = (txHead + 1) % TX_QUEUE_LEN;
         txCount--;
     }
@@ -217,6 +251,7 @@ static void handle(Received &r) {
     uint32_t start = micros();
     if (!secure_packet::open(r.data, keyFor(msgType))) {
         stats.authFailures++;       // altered, corrupted, another key, or an old session
+        total.authFailures++;
         return;
     }
     stats.openSumUs += micros() - start;
@@ -235,6 +270,7 @@ static void handle(Received &r) {
     // an authentic packet with an old seq is a recording being played back.
     if (header.seq <= lastPeerSeq) {
         stats.replaysDropped++;
+        total.replaysDropped++;
         return;
     }
     lastPeerSeq = header.seq;
@@ -242,6 +278,7 @@ static void handle(Received &r) {
 
     if (proto::isInputMessage(header.msg_type)) {
         stats.inputReceived++;
+        total.inputReceived++;
         if (inputHandler) inputHandler(r.data);
         return;
     }
@@ -323,6 +360,7 @@ void begin(PacketHandler onInput) {
     esp_now_set_pmk(DEV_RADIO_KEY);           // benchmark: ESP-NOW's own key hierarchy (first 16 bytes)
 #endif
     esp_now_register_recv_cb(onReceive);
+    esp_now_register_send_cb(onSent);
     addPeer(BROADCAST_MAC, true);   // HELLOs go to everyone until we know our peer
 
     Serial.printf("[radio] ready on channel %u, my MAC %s\n",
@@ -365,7 +403,7 @@ static void testReplay() {
 
     if (havePrevious && !replayedPrevious && t > 2000) {
         replayedPrevious = true;
-        esp_now_send(peerMac, previous, sizeof(previous));
+        if (esp_now_send(peerMac, previous, sizeof(previous)) == ESP_OK) framesSent++;
         Serial.println("[test] replayed a packet recorded in the PREVIOUS session");
     }
     if (!recorded && t > 5000) {
@@ -376,7 +414,7 @@ static void testReplay() {
         memcpy(packet, &header, sizeof(header));
         memcpy(packet + proto::HEADER_SIZE, &hb, sizeof(hb));
         secure_packet::seal(packet, session::sessionKey());
-        esp_now_send(peerMac, packet, sizeof(packet));
+        if (esp_now_send(peerMac, packet, sizeof(packet)) == ESP_OK) framesSent++;
         memcpy(recording, packet, sizeof(recording));
         recordingMagic = RECORDING_VALID;
         recorded = true;
@@ -384,7 +422,7 @@ static void testReplay() {
     }
     if (recorded && !replayedCurrent && t > 8000) {
         replayedCurrent = true;
-        esp_now_send(peerMac, recording, sizeof(recording));
+        if (esp_now_send(peerMac, recording, sizeof(recording)) == ESP_OK) framesSent++;
         Serial.println("[test] replayed a packet recorded in THIS session");
     }
     if (!havePrevious && replayedCurrent && t > 10000) {
@@ -451,6 +489,25 @@ bool sendToPeer(const uint8_t *packet) {
     memcpy(txQueue[(txHead + txCount) % TX_QUEUE_LEN], packet, proto::PACKET_SIZE);
     txCount++;
     return true;
+}
+
+size_t sendQueueSpace() {
+    return TX_QUEUE_LEN - txCount;
+}
+
+Totals totals() {
+    Totals t = total;
+    t.session = sessionGeneration;
+    t.rxOverflow = rxOverflow;
+    t.framesSent = framesSent;
+    t.framesAcked = framesAcked;
+    t.framesFailed = framesFailed;
+    return t;
+}
+
+void setTxWindow(uint8_t window) {
+    txWindow = window;
+    Serial.printf("[radio] TX window set to %u (0 = no limit)\n", window);
 }
 
 }  // namespace radio_link

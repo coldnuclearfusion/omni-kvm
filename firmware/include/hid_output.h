@@ -26,4 +26,11 @@ void syncModifiers(uint8_t modifiers);
 void mouseMove(int16_t dx, int16_t dy, uint8_t buttons);
 void mouseScroll(int16_t vertical, int16_t horizontal);
 
+// Counters since boot, for MSG_DAEMON_STATUS.
+struct Stats {
+    uint32_t keyboardStalls = 0;    // times keyboard output had to wait for USB
+    uint32_t mouseDropped = 0;      // mouse reports dropped: USB not ready
+};
+Stats stats();
+
 }  // namespace hid_output

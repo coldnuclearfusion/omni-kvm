@@ -19,6 +19,13 @@ static const size_t KEY_QUEUE_LEN = 128;
 static USBHIDKeyboard Keyboard;
 static USBHIDMouse Mouse;
 
+// The keyboard and mouse share one USB HID interface. If it isn't ready
+// (e.g. the host has suspended the device), the library drops reports
+// without telling us, so we check first.
+static USBHID hidInterface;
+static Stats counters;
+static bool keyboardStalled = false;
+
 // keyState is the keyboard state the host should end up seeing. Every
 // change queues a full snapshot of it; update() sends the snapshots one
 // gap apart.
@@ -88,7 +95,14 @@ void syncModifiers(uint8_t modifiers) {
 }
 
 // ── Mouse ─────────────────────────────────────────────────
+// Mouse reports are not queued: a late movement is worse than a lost one
+// (it makes the pointer jump), so they are dropped, and counted, when the
+// interface isn't ready.
 void mouseMove(int16_t dx, int16_t dy, uint8_t buttons) {
+    if (!hidInterface.ready()) {
+        counters.mouseDropped++;
+        return;
+    }
     buttons &= MOUSE_ALL;
     if (buttons != mouseButtons) {
         Mouse.release(mouseButtons & ~buttons);
@@ -106,6 +120,10 @@ void mouseMove(int16_t dx, int16_t dy, uint8_t buttons) {
 }
 
 void mouseScroll(int16_t vertical, int16_t horizontal) {
+    if (!hidInterface.ready()) {
+        counters.mouseDropped++;
+        return;
+    }
     while (vertical != 0 || horizontal != 0) {
         int8_t stepV = constrain(vertical, -127, 127);
         int8_t stepH = constrain(horizontal, -127, 127);
@@ -125,10 +143,23 @@ void update() {
     if (queueCount == 0) return;
     if (millis() - lastKeyReportMs < KEY_REPORT_GAP_MS) return;
 
+    // Not ready: keep the report and try again on the next pass, so a
+    // keystroke is delayed rather than lost.
+    if (!hidInterface.ready()) {
+        if (!keyboardStalled) counters.keyboardStalls++;
+        keyboardStalled = true;
+        return;
+    }
+    keyboardStalled = false;
+
     Keyboard.sendReport(&keyQueue[queueHead]);
     queueHead = (queueHead + 1) % KEY_QUEUE_LEN;
     queueCount--;
     lastKeyReportMs = millis();
+}
+
+Stats stats() {
+    return counters;
 }
 
 }  // namespace hid_output

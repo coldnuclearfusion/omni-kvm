@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace radio_link {
@@ -37,5 +38,28 @@ bool isLinkUp();
 // replaced with this board's radio sequence number. Returns false if
 // the link is down or the queue is full.
 bool sendToPeer(const uint8_t *packet);
+
+// Free slots in the send queue. Callers can stop reading input while it
+// is zero instead of dropping packets.
+size_t sendQueueSpace();
+
+// Counters since boot, for MSG_DAEMON_STATUS.
+struct Totals {
+    uint32_t session;           // session generation
+    uint32_t inputSent;
+    uint32_t inputRetries;
+    uint32_t inputReceived;
+    uint32_t rxOverflow;
+    uint32_t authFailures;
+    uint32_t replaysDropped;
+    uint32_t framesSent;
+    uint32_t framesAcked;
+    uint32_t framesFailed;
+};
+Totals totals();
+
+// Most input frames allowed in flight (sent, delivery not yet reported
+// by ESP-NOW). 0 = no limit. Development knob for burst experiments.
+void setTxWindow(uint8_t window);
 
 }  // namespace radio_link

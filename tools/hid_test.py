@@ -10,6 +10,7 @@ Usage (needs pyserial; PlatformIO's Python already has it):
     python tools/hid_test.py move 200 -100
     python tools/hid_test.py click right
     python tools/hid_test.py scroll -3
+    python tools/hid_test.py stats          # the board's link counters
 
 Typed text goes to whichever window has focus. On Windows, add
 --wait-for-notepad to hold the packets until Notepad is in front.
@@ -31,6 +32,18 @@ MSG_MOUSE_MOVE = 0x01
 MSG_MOUSE_SCROLL = 0x02
 MSG_KEY_DOWN = 0x03
 MSG_KEY_UP = 0x04
+MSG_DAEMON_CMD = 0x40
+MSG_DAEMON_STATUS = 0x41
+CMD_REQUEST_LINK_STATS = 0x04
+CMD_SET_TX_WINDOW = 0x06
+STATUS_LINK_STATS = 0x03
+LINK_STATS_FIELDS = ("link_up", "session", "host_received", "host_dropped",
+                     "radio_sent", "radio_send_retries", "radio_received", "radio_rx_overflow",
+                     "auth_failures", "replays_dropped", "frames_sent", "frames_acked",
+                     "frames_failed", "hid_stalls", "hid_mouse_dropped")
+LINK_STATS_LAYOUT = 2            # proto::LINK_STATS_LAYOUT
+LINK_STATS_FORMAT = "<BI11IHH"   # after status_id and layout; matches proto::LinkStats
+assert struct.calcsize(LINK_STATS_FORMAT) == 55 - 2, "out of sync with proto::LinkStats"
 
 MOD_LEFT_SHIFT = 0x02
 MOUSE_BUTTONS = {"left": 0x01, "right": 0x02, "middle": 0x04}
@@ -71,6 +84,29 @@ class Link:
         # "<" = little-endian, as the protocol specifies.
         header = struct.pack("<BBBBI", MAGIC, VERSION, msg_type, 0, self.seq)
         self.serial.write((header + payload).ljust(PACKET_SIZE, b"\x00"))
+
+    def request_stats(self, timeout_s=1.0):
+        """Ask the board for its link counters (MSG_DAEMON_STATUS, see protocol.h)."""
+        self.serial.reset_input_buffer()
+        self.send(MSG_DAEMON_CMD, bytes([CMD_REQUEST_LINK_STATS]))
+        buf = b""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            buf += self.serial.read(PACKET_SIZE)
+            start = buf.find(bytes([MAGIC, VERSION, MSG_DAEMON_STATUS]))
+            if start >= 0 and len(buf) - start >= PACKET_SIZE:
+                payload = buf[start + 8:start + PACKET_SIZE]
+                if payload[0] == STATUS_LINK_STATS:
+                    if payload[1] != LINK_STATS_LAYOUT:
+                        sys.exit(f"Board sends link stats layout {payload[1]}, this tool reads "
+                                 f"layout {LINK_STATS_LAYOUT}. Flash the current firmware.")
+                    values = struct.unpack_from(LINK_STATS_FORMAT, payload, 2)
+                    return dict(zip(LINK_STATS_FIELDS, values))
+        sys.exit("No link stats reply from the board.")
+
+    def set_tx_window(self, window):
+        """Development: most input frames in flight on the board (0 = no limit)."""
+        self.send(MSG_DAEMON_CMD, bytes([CMD_SET_TX_WINDOW, window]))
 
     def close(self):
         self.serial.flush()
@@ -126,6 +162,9 @@ def main():
     sub.add_parser("click").add_argument("button", nargs="?", default="left",
                                          choices=MOUSE_BUTTONS)
     sub.add_parser("scroll").add_argument("amount", type=int, help="positive = up")
+    sub.add_parser("stats")
+    sub.add_parser("window", help="development: set the board's radio TX window").add_argument(
+        "frames", type=int, help="most input frames in flight, 0 = no limit")
     args = parser.parse_args()
 
     link = Link(args.port or find_board_port())
@@ -142,9 +181,15 @@ def main():
         link.send(MSG_MOUSE_MOVE, struct.pack("<hhB", 0, 0, 0))
     elif args.command == "scroll":
         link.send(MSG_MOUSE_SCROLL, struct.pack("<hh", args.amount, 0))
+    elif args.command == "stats":
+        for name, value in link.request_stats().items():
+            print(f"{name:20s} {value}")
+    elif args.command == "window":
+        link.set_tx_window(args.frames)
 
     link.close()
-    print(f"Sent {link.seq} packets.")
+    if args.command in ("type", "move", "click", "scroll"):
+        print(f"Sent {link.seq} packets.")
 
 
 if __name__ == "__main__":
