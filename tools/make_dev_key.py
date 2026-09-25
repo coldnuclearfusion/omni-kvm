@@ -31,7 +31,7 @@ def main():
     if KEY_FILE.exists() and not args.force:
         sys.exit(f"{KEY_FILE} already exists. Use --force to replace it.")
 
-    key = secrets.token_bytes(16)   # from the OS's cryptographic RNG
+    key = secrets.token_bytes(32)   # 256-bit ChaCha20 key, from the OS's cryptographic RNG
     body = ", ".join(f"0x{b:02X}" for b in key)
     KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEY_FILE.write_text(
@@ -39,7 +39,7 @@ def main():
         "// Temporary development key for the radio link; pairing replaces it in Phase 5.\n"
         "#pragma once\n"
         "#include <stdint.h>\n"
-        f"static const uint8_t DEV_RADIO_KEY[16] = {{{body}}};\n"
+        f"static const uint8_t DEV_RADIO_KEY[32] = {{{body}}};\n"
     )
     print(f"Wrote {KEY_FILE}")
 

@@ -16,10 +16,24 @@
 #else
 #error "No radio key. Run: python tools/make_dev_key.py (then flash both boards)"
 #endif
+static_assert(sizeof(DEV_RADIO_KEY) == secure_packet::KEY_SIZE,
+              "Old 128-bit key. Run: python tools/make_dev_key.py --force (then flash both boards)");
+
+// Radio settings, overridable with build flags for experiments. Chosen
+// from the Phase 2 jitter experiment (shared/protocol.md, "Radio
+// settings"): 24 Mbps halved the median RTT versus ESP-NOW's default
+// 1 Mbps and cut samples over 5 ms from ~19% to ~2%.
+#ifndef OMNI_RADIO_CHANNEL
+#define OMNI_RADIO_CHANNEL 6
+#endif
+#ifndef OMNI_RADIO_PHY_RATE
+#define OMNI_RADIO_PHY_RATE WIFI_PHY_RATE_24M
+#endif
+// OMNI_LOG_RTT_SAMPLES: 1 prints every RTT sample ("rtt <us>").
 
 namespace radio_link {
 
-static const uint8_t RADIO_CHANNEL = 1;             // both boards must match
+static const uint8_t RADIO_CHANNEL = OMNI_RADIO_CHANNEL;   // both boards must match
 static const uint32_t HEARTBEAT_INTERVAL_MS = 100;
 static const uint32_t LINK_TIMEOUT_MS = 3000;       // 30 missed heartbeats
 static const uint32_t STATS_INTERVAL_MS = 2000;
@@ -47,6 +61,7 @@ static QueueHandle_t rxQueue = nullptr;
 
 static uint32_t txSeq = 0;
 static bool havePeer = false;
+static bool peerConfirmed = false;  // the peer has answered one of our heartbeats
 static uint8_t peerMac[6];
 static uint32_t lastHeardMs = 0;
 static uint32_t lastPeerSeq = 0;    // highest seq accepted from the peer
@@ -87,12 +102,19 @@ static void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
     xQueueSend(rxQueue, &r, 0);     // if the queue is full, drop it
 }
 
-static void addPeer(const uint8_t *mac) {
+static void addPeer(const uint8_t *mac, bool isBroadcast = false) {
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac, sizeof(peer.peer_addr));
     peer.channel = 0;               // 0 = the channel we are already on
     peer.ifidx = WIFI_IF_STA;
+#if OMNI_RADIO_CRYPTO == OMNI_CRYPTO_ESPNOW
+    // Benchmark mode: let ESP-NOW encrypt unicast frames itself (CCMP).
+    // ESP-NOW cannot encrypt broadcast frames.
+    peer.encrypt = !isBroadcast;
+    memcpy(peer.lmk, DEV_RADIO_KEY, sizeof(peer.lmk));   // first 16 bytes
+#else
     peer.encrypt = false;           // we encrypt ourselves (secure_packet), not ESP-NOW
+#endif
     esp_now_add_peer(&peer);
 }
 
@@ -188,7 +210,11 @@ static void handle(Received &r) {
             send(peerMac, proto::MSG_HEARTBEAT_ACK, &hb, sizeof(hb));   // echo it back
             break;
         case proto::MSG_HEARTBEAT_ACK: {
+            peerConfirmed = true;
             uint32_t rtt = micros() - hb.timestamp;
+#if OMNI_LOG_RTT_SAMPLES
+            Serial.printf("rtt %u\n", rtt);
+#endif
             stats.rttCount++;
             stats.rttSumUs += rtt;
             stats.rttMinUs = min(stats.rttMinUs, rtt);
@@ -215,7 +241,8 @@ static void printStats() {
         Serial.printf("[radio] input sent %u (retries %u), received %u\n",
                       stats.inputSent, stats.inputRetries, stats.inputReceived);
     }
-    Serial.printf("[radio] crypto: seal avg %u us, open avg %u us | auth failures %u, replays dropped %u\n",
+    Serial.printf("[radio] crypto %s: seal avg %u us, open avg %u us | auth failures %u, replays dropped %u\n",
+                  secure_packet::modeName(),
                   stats.sealCount ? stats.sealSumUs / stats.sealCount : 0,
                   stats.openCount ? stats.openSumUs / stats.openCount : 0,
                   stats.authFailures, stats.replaysDropped);
@@ -234,14 +261,18 @@ void begin(PacketHandler onInput) {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, true);
     esp_wifi_set_channel(RADIO_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, OMNI_RADIO_PHY_RATE);   // must follow esp_wifi_start()
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[radio] ESP-NOW init failed");
         return;
     }
     secure_packet::begin(DEV_RADIO_KEY);   // Wi-Fi is on, so the RNG is truly random
+#if OMNI_RADIO_CRYPTO == OMNI_CRYPTO_ESPNOW
+    esp_now_set_pmk(DEV_RADIO_KEY);        // benchmark: ESP-NOW's own key hierarchy (first 16 bytes)
+#endif
     esp_now_register_recv_cb(onReceive);
-    addPeer(BROADCAST_MAC);   // heartbeats go to everyone until we know our peer
+    addPeer(BROADCAST_MAC, true);   // heartbeats go to everyone until the peer answers
 
     Serial.printf("[radio] ready on channel %u, my MAC %s\n",
                   RADIO_CHANNEL, WiFi.macAddress().c_str());
@@ -259,7 +290,10 @@ void update() {
     if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = now;
         proto::Heartbeat hb = {micros(), 0};    // link quality not measured yet
-        send(havePeer ? peerMac : BROADCAST_MAC, proto::MSG_HEARTBEAT, &hb, sizeof(hb));
+        // Keep broadcasting until the peer has answered: it may not know
+        // us yet, and with ESP-NOW's own encryption it can only read
+        // unicast frames from boards it has already registered.
+        send(peerConfirmed ? peerMac : BROADCAST_MAC, proto::MSG_HEARTBEAT, &hb, sizeof(hb));
         stats.heartbeatsSent++;
     }
 

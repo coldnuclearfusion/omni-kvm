@@ -152,6 +152,12 @@ static void pollDaemonLink() {
 // ── Setup: runs once at boot ──────────────────────────────
 void setup() {
     // UART0 -> "UART" port (see platformio.ini build_flags)
+    // With a TX buffer, Serial.print copies into it and returns; without
+    // one it can wait until the bytes have left the 128-byte UART FIFO,
+    // stalling the loop (and any input waiting in it) for ~10 ms per log
+    // line. It made no measurable RTT difference in Phase 2, but logging
+    // should never be able to delay input.
+    Serial.setTxBufferSize(1024);
     Serial.begin(115200);
 
     // By default, a special DTR/RTS sequence on this port reboots the
