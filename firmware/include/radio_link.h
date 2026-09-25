@@ -6,7 +6,8 @@
 // send MSG_HEARTBEAT every 100 ms and answer each other's heartbeats
 // with MSG_HEARTBEAT_ACK, which gives a round-trip time (RTT)
 // measurement. Input packets (keyboard/mouse) queued with sendToPeer()
-// are delivered to the peer's input handler.
+// are delivered to the peer's input handler, and daemon-to-daemon
+// messages (proto::isRelayMessage) to its relay handler.
 //
 // Every radio packet is sealed (secure_packet.h); within a session, a
 // packet with an old sequence number is dropped as a replay.
@@ -22,11 +23,11 @@
 
 namespace radio_link {
 
-// Called with each input packet (64 bytes) received from the peer.
+// Called with each input or relayed packet (64 bytes) received from the peer.
 using PacketHandler = void (*)(const uint8_t *packet);
 
 // Starts the radio and ESP-NOW. Call once from setup().
-void begin(PacketHandler onInput);
+void begin(PacketHandler onInput, PacketHandler onRelay);
 
 // Handles received packets and sends queued ones. Call on every loop pass.
 void update();
@@ -35,10 +36,10 @@ void update();
 bool isLinkUp();
 
 // Queues a 64-byte protocol packet for the peer. Its header seq is
-// replaced with this board's radio sequence number. Input packets go out
-// one at a time; a key event (or mouse button change) whose delivery
-// fails is sent again before anything queued after it. Returns false if
-// the link is down or the queue is full.
+// replaced with this board's radio sequence number. Packets go out in
+// order; a key event, mouse button change or relayed message whose
+// delivery fails is sent again before anything queued after it. Returns
+// false if the link is down or the queue is full.
 bool sendToPeer(const uint8_t *packet);
 
 // Free slots in the send queue. Callers can stop reading input while it

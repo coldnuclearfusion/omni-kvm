@@ -26,6 +26,10 @@ void syncModifiers(uint8_t modifiers);
 void mouseMove(int16_t dx, int16_t dy, uint8_t buttons);
 void mouseScroll(int16_t vertical, int16_t horizontal);
 
+// Lets go of every key, modifier and mouse button, e.g. when the peer
+// that pressed them is gone and its "key up" can never arrive.
+void releaseAll();
+
 // Counters since boot, for MSG_DAEMON_STATUS.
 struct Stats {
     uint32_t keyboardStalls = 0;    // times keyboard output had to wait for USB

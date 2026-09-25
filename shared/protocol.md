@@ -84,6 +84,17 @@ Value  Name                  Direction       Description
 
 "source" = currently active side, "sink" = currently passive side. For symmetric messages (heartbeat, pairing), either side can send.
 
+### Relayed daemon-to-daemon messages
+
+Types **0x10–0x1F** (handoff) and **0x50–0x5F** (lock) are conversations between the two daemons. A board takes them from its host over USB, sends them to the peer board like acknowledged input (see [Sequencing and reliability](#sequencing-and-reliability)), and the peer board writes them unchanged to its own host's USB serial port. The firmware never reads their payload, so the daemons can add message types in these ranges without a firmware update.
+
+- **Size**: only the first 28 bytes after the header cross the radio; the rest arrives as zeros.
+- **Header on arrival**: `seq` is the sending board's radio sequence number, and `flags` may still have `ACK_REQUESTED` set. Daemons ignore both.
+- **Duplicates**: if a board's acknowledgement is lost, the message is resent and reaches the peer daemon twice. Daemons must treat a repeat as harmless.
+- **No daemon listening**: if the peer's USB serial port is closed, or its buffer is full, the peer board drops the message (and logs it on its UART port). A daemon that needs an answer waits for one (e.g. `MSG_HANDOFF_ACK`) and decides what to do without it.
+
+Measured round trip, Windows daemon → Mac daemon → Windows daemon through both boards: 4.0 ms.
+
 ## Payload definitions
 
 These describe the plaintext payload. On the radio, message data is limited to 28 bytes and travels encrypted; see [Encryption](#encryption).
@@ -274,12 +285,12 @@ Offset  Size  Field               Description
 10      1     link_up             1 while the radio link is up
 11      1     phy_rate            Current radio TX rate (ESP-IDF wifi_phy_rate_t)
 12      4     session             Session generation (0 = none yet)
-16      4     host_received       Input packets from this board's host
+16      4     host_received       Input and relayed packets from this board's host
 20      4     host_dropped        ...not queued for the radio (link down, queue full)
-24      4     radio_sent          Input packets handed to ESP-NOW, retransmissions included
+24      4     radio_sent          Input and relayed packets handed to ESP-NOW, retransmissions included
 28      4     radio_retransmits   Input packets sent again: no MSG_INPUT_ACK in time
 32      4     radio_gave_up       Input packets never acknowledged after every attempt
-36      4     radio_received      Authentic input packets from the peer
+36      4     radio_received      Authentic input and relayed packets from the peer
 40      4     radio_rx_overflow   Radio packets lost: receive queue full
 44      4     auth_failures       Radio packets whose tag did not verify
 48      4     replays_dropped     Authentic packets with an old sequence number
@@ -380,7 +391,7 @@ ESP-NOW provides a basic ACK at the MAC layer, but we add application-level sequ
 
 1. **Replay protection**: Receiver maintains `last_seen_seq` per peer and session. Any authentic packet with `seq <= last_seen_seq` is dropped. The counter restarts only with a new session, whose new key makes packets from earlier sessions fail authentication (see [Sessions](#sessions)).
 2. **Ordering**: Input events must be applied in order. If packet N+1 arrives before N, the receiver buffers N+1 briefly (up to 5 ms) waiting for N. If N doesn't arrive, N+1 is applied and N is considered lost.
-3. **Acknowledged input**: key events, modifier syncs, and mouse moves that change the button state go out with `ACK_REQUESTED`. The receiving board applies the packet, then answers `MSG_INPUT_ACK{seq}`. The sender keeps at most one such packet outstanding and sends nothing queued after it until it is acknowledged, retransmitting it (with a new sequence number) if no acknowledgement arrives within 25 ms, up to 6 attempts in total. This preserves order, so the peer never sees "key up" before a late "key down", and a lost acknowledgement is harmless: the copy is applied again, and input messages carry state ("key A is down"), not toggles. The same mechanism will serve HANDOFF, PAIR_*, LOCK/UNLOCK.
+3. **Acknowledged input**: key events, modifier syncs, and mouse moves that change the button state go out with `ACK_REQUESTED`. The receiving board applies the packet, then answers `MSG_INPUT_ACK{seq}`. The sender keeps at most one such packet outstanding and sends nothing queued after it until it is acknowledged, retransmitting it (with a new sequence number) if no acknowledgement arrives within 25 ms, up to 6 attempts in total. This preserves order, so the peer never sees "key up" before a late "key down", and a lost acknowledgement is harmless: the copy is applied again, and input messages carry state ("key A is down"), not toggles. Relayed daemon messages (HANDOFF, LOCK/UNLOCK) use the same mechanism; PAIR_* will too.
 4. **Plain mouse movement is not acknowledged or retransmitted**: a 10 ms-old delta is worse than a dropped one (it makes the pointer jump), and the next movement corrects the position anyway.
 
 **Why end-to-end.** ESP-NOW already retries at the MAC layer and reports each frame as delivered or failed, but "delivered" only means the peer's radio received it. A first version resent key events when ESP-NOW reported a failure, matching reports to frames in send order; a key was still lost with every frame reported delivered. With `MSG_INPUT_ACK`, a line typed into a Mac at 24 Mbps from the worst spot, with 20% of frames failing, arrived intact after 27 retransmissions.

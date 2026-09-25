@@ -133,6 +133,16 @@ void mouseScroll(int16_t vertical, int16_t horizontal) {
     }
 }
 
+void releaseAll() {
+    bool held = keyState.modifiers != 0;
+    for (uint8_t k : keyState.keys) held = held || k != 0;
+    if (held) {
+        keyState = {};
+        queueKeyState();
+    }
+    if (mouseButtons != 0) mouseMove(0, 0, 0);
+}
+
 // ── Setup and pacing ──────────────────────────────────────
 void begin() {
     Keyboard.begin();

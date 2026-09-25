@@ -53,6 +53,15 @@ inline bool isInputMessage(uint8_t msgType) {
     return msgType >= MSG_MOUSE_MOVE && msgType <= MSG_MODIFIER_SYNC;
 }
 
+// Messages between the two daemons (handoff 0x10–0x1F, lock 0x50–0x5F).
+// The boards pass them along without reading them: host → board → radio
+// → peer board → peer's host. Whole ranges, so new daemon messages need
+// no firmware change. Only the first 28 bytes after the header survive
+// the radio (SEALED_DATA_SIZE).
+inline bool isRelayMessage(uint8_t msgType) {
+    return (msgType >= 0x10 && msgType <= 0x1F) || (msgType >= 0x50 && msgType <= 0x5F);
+}
+
 // Header flags (bits 3–7 are reserved and must be 0)
 constexpr uint8_t FLAG_ACK_REQUESTED = 1 << 0;
 constexpr uint8_t FLAG_IS_ACK        = 1 << 1;

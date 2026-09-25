@@ -1,16 +1,17 @@
 // ============================================================
-// Omni-KVM Firmware — Phase 2 (in progress): radio link
+// Omni-KVM Firmware
 // ============================================================
 // The "USB" port is a composite device: HID keyboard + mouse, plus a
 // CDC serial channel for the host daemon. Both boards run this same
 // firmware:
 //
 //   host ──CDC──▶ this board ══ESP-NOW══▶ peer board ──HID──▶ peer's host
+//                                                    └──CDC──▶ peer's daemon
 //
 // Input packets (shared/protocol.md) from the host are forwarded to
 // the peer over the radio; input packets from the peer are injected
-// into this board's host as keyboard/mouse reports. Until the daemon
-// exists, tools/hid_test.py plays the host's part.
+// into this board's host as keyboard/mouse reports. Daemon-to-daemon
+// messages (handoff) are passed along to the peer's daemon unread.
 //
 // LED: green = no peer, blue = radio link up.
 //
@@ -111,6 +112,31 @@ static void injectInput(const uint8_t *raw) {
     }
 }
 
+// If the link drops, or the peer restarts, while it holds a key or
+// button down here, its "key up" can never arrive: let go of everything.
+static void releaseInputOnLinkLoss() {
+    static bool wasUp = false;
+    static uint32_t lastSession = 0;
+    bool up = radio_link::isLinkUp();
+    uint32_t session = radio_link::totals().session;
+    if ((wasUp && !up) || (up && session != lastSession)) hid_output::releaseAll();
+    wasUp = up;
+    lastSession = session;
+}
+
+// ── Messages from the peer's daemon → this host's daemon ──
+// The board only passes them along. With no daemon listening, or one
+// that has stopped reading, the message is dropped rather than letting
+// the write stall the loop (and input) for the CDC timeout.
+static void relayToHost(const uint8_t *raw) {
+    if (DaemonSerial.availableForWrite() < (int)proto::PACKET_SIZE) {
+        Serial.printf("[host] no daemon listening: dropped message 0x%02X from the peer\n",
+                      raw[offsetof(proto::Header, msg_type)]);
+        return;
+    }
+    DaemonSerial.write(raw, proto::PACKET_SIZE);
+}
+
 // ── Requests from this host to the board itself ──────────
 static void replyLinkStats() {
     radio_link::Totals t = radio_link::totals();
@@ -154,7 +180,8 @@ static void handleDaemonCommand(const uint8_t *raw) {
 }
 
 // ── Packets from this host ────────────────────────────────
-// Input goes to the peer; MSG_DAEMON_CMD is for this board.
+// Input and daemon-to-daemon messages go to the peer; MSG_DAEMON_CMD is
+// for this board.
 static void handleHostPacket(const uint8_t *raw) {
     proto::Header header;
     memcpy(&header, raw, sizeof(header));
@@ -163,7 +190,8 @@ static void handleHostPacket(const uint8_t *raw) {
         handleDaemonCommand(raw);
         return;
     }
-    if (header.version != proto::VERSION || !proto::isInputMessage(header.msg_type)) {
+    bool forPeer = proto::isInputMessage(header.msg_type) || proto::isRelayMessage(header.msg_type);
+    if (header.version != proto::VERSION || !forPeer) {
         Serial.printf("[host] ignored packet: version 0x%02X, msg_type 0x%02X\n",
                       header.version, header.msg_type);
         return;
@@ -226,10 +254,10 @@ void setup() {
     USB.manufacturerName("Omni-KVM Project");
     USB.begin();
 
-    radio_link::begin(injectInput);
+    radio_link::begin(injectInput, relayToHost);
 
     Serial.println("========================================");
-    Serial.println("  Omni-KVM Firmware v0.2.0-dev (Phase 2)");
+    Serial.println("  Omni-KVM Firmware v0.4.0-dev (Phase 4)");
     Serial.println("  Board: ESP32-S3-DevKitC-1-N8R8");
     Serial.println("========================================");
     Serial.println();
@@ -245,4 +273,5 @@ void loop() {
     pollDaemonLink();
     hid_output::update();
     radio_link::update();
+    releaseInputOnLinkLoss();
 }

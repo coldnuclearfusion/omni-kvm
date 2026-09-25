@@ -48,6 +48,7 @@ static const uint8_t MAX_INPUT_ATTEMPTS = 6;         // first try + 5 retransmis
 static const uint32_t INPUT_ACK_TIMEOUT_MS = 25;     // a round trip normally takes ~2 ms
 
 static PacketHandler inputHandler = nullptr;
+static PacketHandler relayHandler = nullptr;
 
 // Input packets waiting to go out, in order.
 struct Outgoing {
@@ -335,13 +336,17 @@ static void handle(Received &r) {
     lastPeerSeq = header.seq;
     lastHeardMs = millis();
 
-    if (proto::isInputMessage(header.msg_type)) {
+    bool isInput = proto::isInputMessage(header.msg_type);
+    if (isInput || proto::isRelayMessage(header.msg_type)) {
         stats.inputReceived++;
         total.inputReceived++;
-        if (inputHandler) inputHandler(r.data);
-        // Acknowledge after processing, so "acknowledged" means "applied".
-        // A retransmitted copy is applied again, which is harmless: input
-        // messages carry state ("key A is down"), not toggles.
+        PacketHandler handler = isInput ? inputHandler : relayHandler;
+        if (handler) handler(r.data);
+        // Acknowledge after processing, so "acknowledged" means "applied"
+        // (for a relayed message: handed to the host). A retransmitted
+        // copy is processed again, which is harmless: input messages
+        // carry state ("key A is down"), not toggles, and daemons must
+        // accept a relayed message twice.
         if (header.flags & proto::FLAG_ACK_REQUESTED) {
             proto::InputAck ack = {header.seq};
             send(peerMac, proto::MSG_INPUT_ACK, &ack, sizeof(ack));
@@ -406,8 +411,9 @@ static void printStats() {
     stats = Stats();
 }
 
-void begin(PacketHandler onInput) {
+void begin(PacketHandler onInput, PacketHandler onRelay) {
     inputHandler = onInput;
+    relayHandler = onRelay;
     rxQueue = xQueueCreate(RX_QUEUE_LEN, sizeof(Received));
 
     // ESP-NOW needs the Wi-Fi radio running in station mode, but we never
@@ -562,8 +568,11 @@ bool isLinkUp() {
 // the next one moves it anyway. But a movement that changes the buttons
 // is, or a click or drag could get stuck. Repeats are harmless, because
 // the peer applies them as state ("key A is down"), not as toggles.
+// Relayed daemon messages (a handoff) are rare and must arrive too.
 static bool needsAck(const uint8_t *packet) {
-    switch (packet[offsetof(proto::Header, msg_type)]) {
+    uint8_t msgType = packet[offsetof(proto::Header, msg_type)];
+    if (proto::isRelayMessage(msgType)) return true;
+    switch (msgType) {
         case proto::MSG_KEY_DOWN:
         case proto::MSG_KEY_UP:
         case proto::MSG_MODIFIER_SYNC:
