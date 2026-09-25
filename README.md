@@ -76,6 +76,7 @@ omni-kvm/
 ├── daemon-windows/   Windows host daemon
 ├── daemon-macos/     macOS host daemon
 ├── shared/           Shared protocol definitions and constants
+├── tools/            Development and test utilities
 └── docs/             Architecture, protocol, security documentation
 ```
 

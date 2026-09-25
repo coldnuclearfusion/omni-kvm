@@ -1,43 +1,47 @@
 // ============================================================
-// Omni-KVM Firmware — Phase 1: USB HID keyboard + mouse
+// Omni-KVM Firmware — Phase 1: USB HID driven by protocol packets
 // ============================================================
-// Purpose: Make the board show up as a standard USB keyboard +
-//          mouse on its "USB" port, with no driver install.
-//          Pressing the BOOT button types a test line and moves
-//          the mouse in a small square.
+// Purpose: The "USB" port is a composite device: HID keyboard +
+//          mouse, plus a CDC serial channel. 64-byte protocol
+//          packets (shared/protocol.md) arriving on the CDC channel
+//          are turned into keyboard/mouse input on the same host.
 //
-// Cables:  "UART" port -> PC (upload + serial monitor)
+//          In the final design the CDC channel belongs to the host
+//          daemon and input packets come from the peer board over
+//          the radio. For now the PC sends input packets itself
+//          (tools/hid_test.py) and the board handles them as if
+//          they came from the radio.
+//
+// Cables:  "UART" port -> PC (upload + debug log)
 //          "USB"  port -> the computer to control (can be the same PC)
 // ============================================================
 
 #include <Arduino.h>
 #include "USB.h"
-#include "USBHIDKeyboard.h"
-#include "USBHIDMouse.h"
+#include "hid_output.h"
+#include "protocol.h"
 
 // The ESP32-S3-DevKitC-1 has a WS2812 RGB LED on GPIO 38.
 // (The PCB silkscreen labels this as "RGB@IO38".)
 static const uint8_t LED_PIN = 38;
-
-// The BOOT button is wired to GPIO 0. After boot it is an ordinary
-// input: HIGH when released (internal pull-up), LOW when pressed.
-static const uint8_t BOOT_BUTTON_PIN = 0;
-
 static const uint32_t BLINK_INTERVAL_MS = 500;
-static const uint32_t DEBOUNCE_MS = 50;
-static const uint32_t KEY_HOLD_MS = 10;   // how long each key stays down
-static const uint32_t KEY_GAP_MS = 10;    // pause between key events
 
-USBHIDKeyboard Keyboard;
-USBHIDMouse Mouse;
+// Room for bursts from the PC. The Arduino USB CDC driver drops bytes
+// when this buffer is full (default 256 bytes = only 4 packets).
+static const size_t DAEMON_RX_BUFFER = 4096;
+
+// CDC serial channel on the "USB" port (shows up as a COM port).
+USBCDC DaemonSerial;
+
+static uint32_t packetsReceived = 0;
 
 // ── Heartbeat LED (non-blocking) ──────────────────────────
-// Phase 0 used delay(), which freezes the whole program. Here we
-// check the clock on every loop pass and only toggle the LED once
-// enough time has passed, so the loop can also watch the button.
+// Toggles the LED every BLINK_INTERVAL_MS and, while at it, reports
+// how many packets arrived since the last report.
 static void updateHeartbeat() {
     static uint32_t lastToggle = 0;
     static bool ledOn = false;
+    static uint32_t packetsReported = 0;
 
     uint32_t now = millis();
     if (now - lastToggle < BLINK_INTERVAL_MS) return;
@@ -45,79 +49,103 @@ static void updateHeartbeat() {
 
     ledOn = !ledOn;
     neopixelWrite(LED_PIN, 0, ledOn ? 20 : 0, 0);
-}
 
-// ── BOOT button (debounced) ───────────────────────────────
-// Returns true once per press. Mechanical contacts "bounce" (flicker
-// for a few ms) when pressed, so a change only counts after the
-// reading has stayed the same for DEBOUNCE_MS.
-static bool bootButtonPressed() {
-    static bool stableState = HIGH;
-    static bool lastReading = HIGH;
-    static uint32_t lastChange = 0;
-
-    bool reading = digitalRead(BOOT_BUTTON_PIN);
-    if (reading != lastReading) {
-        lastReading = reading;
-        lastChange = millis();
+    if (packetsReceived != packetsReported) {
+        Serial.printf("[link] %u packets received so far\n", packetsReceived);
+        packetsReported = packetsReceived;
     }
-    if (millis() - lastChange < DEBOUNCE_MS || reading == stableState) return false;
-
-    stableState = reading;
-    return stableState == LOW;
 }
 
-// ── Typing like a person ──────────────────────────────────
-// Keyboard.print() sends key-down and key-up reports ~1 ms apart,
-// with Shift in the same report as the key. On Windows (Korean IME,
-// Notepad) that came out garbled 3 times out of 3: dropped letters,
-// Shift landing on the wrong keys, a lost Enter. Typing like a person
-// (Shift first, keys held for a few ms) came out right 3 out of 3.
-static bool needsShift(char c) {
-    return isupper(c) || strchr("~!@#$%^&*()_+{}|:\"<>?", c) != nullptr;
-}
+// ── Packet handling ───────────────────────────────────────
+// Replay protection (sequence numbers) belongs to the radio path and
+// arrives in Phase 2. The CDC channel is a cable to the trusted host.
+static void handlePacket(const uint8_t *raw) {
+    proto::Header header;
+    memcpy(&header, raw, sizeof(header));
+    const uint8_t *payload = raw + proto::HEADER_SIZE;
 
-static void typeLikeAPerson(const char *text) {
-    for (const char *p = text; *p; p++) {
-        bool shift = needsShift(*p);
-        if (shift) {
-            Keyboard.press(KEY_LEFT_SHIFT);
-            delay(KEY_GAP_MS);
+    if (header.version != proto::VERSION) {
+        Serial.printf("[link] dropped packet: version 0x%02X\n", header.version);
+        return;
+    }
+    if (header.flags & proto::FLAG_ENCRYPTED) {
+        Serial.println("[link] dropped packet: encryption not supported yet");
+        return;
+    }
+
+    switch (header.msg_type) {
+        case proto::MSG_KEY_DOWN: {
+            proto::KeyEvent e;
+            memcpy(&e, payload, sizeof(e));
+            hid_output::keyDown(e.keycode, e.modifiers);
+            break;
         }
-        Keyboard.press(*p);
-        delay(KEY_HOLD_MS);
-        Keyboard.release(*p);   // also lifts Shift for shifted characters
-        delay(KEY_GAP_MS);
+        case proto::MSG_KEY_UP: {
+            proto::KeyEvent e;
+            memcpy(&e, payload, sizeof(e));
+            hid_output::keyUp(e.keycode, e.modifiers);
+            break;
+        }
+        case proto::MSG_MODIFIER_SYNC: {
+            proto::ModifierSync m;
+            memcpy(&m, payload, sizeof(m));
+            hid_output::syncModifiers(m.modifiers);
+            break;
+        }
+        case proto::MSG_MOUSE_MOVE: {
+            proto::MouseMove m;
+            memcpy(&m, payload, sizeof(m));
+            hid_output::mouseMove(m.dx, m.dy, m.buttons);
+            break;
+        }
+        case proto::MSG_MOUSE_SCROLL: {
+            proto::MouseScroll s;
+            memcpy(&s, payload, sizeof(s));
+            hid_output::mouseScroll(s.vertical, s.horizontal);
+            break;
+        }
+        default:
+            Serial.printf("[link] ignored msg_type 0x%02X\n", header.msg_type);
+            break;
     }
 }
 
-// ── HID demo ──────────────────────────────────────────────
-static void runHidDemo() {
-    Serial.println("[hid] typing test line");
-    typeLikeAPerson("Hello from Omni-KVM!\n");
+// Reads whatever bytes have arrived and assembles them into 64-byte
+// packets. A USB serial link is a plain byte stream with no packet
+// boundaries, so we wait for the magic byte to find where a packet
+// starts, then collect PACKET_SIZE bytes.
+static void pollDaemonLink() {
+    static uint8_t buffer[proto::PACKET_SIZE];
+    static size_t length = 0;
 
-    Serial.println("[hid] moving mouse in a square");
-    const int8_t step = 5;
-    const int8_t directions[4][2] = { {step, 0}, {0, step}, {-step, 0}, {0, -step} };
-    for (const auto &dir : directions) {
-        for (int i = 0; i < 20; i++) {
-            Mouse.move(dir[0], dir[1]);
-            delay(10);
+    while (DaemonSerial.available() > 0) {
+        uint8_t b = DaemonSerial.read();
+        if (length == 0 && b != proto::MAGIC) continue;   // not a packet start
+
+        buffer[length++] = b;
+        if (length == proto::PACKET_SIZE) {
+            packetsReceived++;
+            handlePacket(buffer);
+            length = 0;
         }
     }
-    Serial.println("[hid] done");
 }
 
 // ── Setup: runs once at boot ──────────────────────────────
 void setup() {
     // UART0 -> "UART" port (see platformio.ini build_flags)
     Serial.begin(115200);
-    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
-    // Register keyboard + mouse, then start USB. The names show up
-    // in Device Manager / System Information on the host.
-    Keyboard.begin();
-    Mouse.begin();
+    // By default, a special DTR/RTS sequence on this port reboots the
+    // chip into the bootloader. This port belongs to the daemon, so turn
+    // that off; uploads go through the "UART" port.
+    DaemonSerial.enableReboot(false);
+    DaemonSerial.setRxBufferSize(DAEMON_RX_BUFFER);
+    DaemonSerial.begin();
+
+    // Register keyboard + mouse + CDC, then start USB. The names show
+    // up in Device Manager / System Information on the host.
+    hid_output::begin();
     USB.productName("Omni-KVM");
     USB.manufacturerName("Omni-KVM Project");
     USB.begin();
@@ -127,12 +155,15 @@ void setup() {
     Serial.println("  Board: ESP32-S3-DevKitC-1-N8R8");
     Serial.println("========================================");
     Serial.println();
-    Serial.println("Press BOOT to type a test line and move the mouse.");
+    Serial.println("Waiting for protocol packets on the USB port.");
     Serial.println();
 }
 
 // ── Loop: runs repeatedly after setup ─────────────────────
+// Nothing here waits: packets are read as they arrive, and keyboard
+// reports leave at a paced rate from hid_output's queue.
 void loop() {
     updateHeartbeat();
-    if (bootButtonPressed()) runHidDemo();
+    pollDaemonLink();
+    hid_output::update();
 }
