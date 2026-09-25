@@ -4,8 +4,9 @@
 //! the pointer is "on the Mac", forward them to the local board, which
 //! relays them over the radio to the board plugged into the Mac.
 //!
-//! On macOS (Phase 4, step 1): connect to the local board and report the
-//! link. Input capture on the Mac comes next.
+//! On macOS (Phase 4, step 2): place the pointer where Windows hands it
+//! over, and report when it touches a screen edge, so pushing it past the
+//! left edge brings it back to Windows. Input capture on the Mac is next.
 
 mod board;
 mod input;
@@ -13,20 +14,29 @@ mod input;
 mod input_windows;
 #[cfg(windows)]
 mod keymap;
+mod peer;
 mod protocol;
+#[cfg(target_os = "macos")]
+mod screen_macos;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use board::Board;
 use input::Event;
-use protocol::msg;
+use peer::{Peer, PeerMsg};
+use protocol::{LinkStats, PACKET_SIZE, msg};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STATUS_INTERVAL: Duration = Duration::from_secs(10);
+/// No status reply for this long: the board is gone (unplugged, reset).
+const BOARD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the board thread waits for something to send before checking
+/// for packets from the board again. Anything to send wakes it at once;
+/// this only bounds how late a message from the other daemon is noticed.
+const IDLE_WAIT: Duration = Duration::from_millis(5);
 
 fn main() {
     println!("Omni-KVM daemon {}", env!("CARGO_PKG_VERSION"));
@@ -35,42 +45,47 @@ fn main() {
     let wanted_port = std::env::args().nth(1);
 
     let (tx, rx) = mpsc::channel();
-    let link_up = Arc::new(AtomicBool::new(false));
+    let peer = Arc::new(Peer::new());
     {
-        let link_up = link_up.clone();
-        thread::spawn(move || board_loop(rx, link_up, wanted_port));
+        let peer = peer.clone();
+        thread::spawn(move || board_loop(rx, peer, wanted_port));
     }
-    capture_input(tx, link_up);
+    run_input_side(tx, peer);
 }
 
 #[cfg(windows)]
-fn capture_input(tx: Sender<Event>, link_up: Arc<AtomicBool>) {
+fn run_input_side(tx: Sender<Event>, peer: Arc<Peer>) {
     // The hooks must live on a thread that pumps messages: this one.
-    if let Err(e) = input_windows::run(tx, link_up) {
+    if let Err(e) = input_windows::run(tx, peer) {
         eprintln!("Input capture failed: {e}");
         std::process::exit(1);
     }
 }
 
-#[cfg(not(windows))]
-fn capture_input(tx: Sender<Event>, _link_up: Arc<AtomicBool>) {
-    // No input capture on this OS yet: only the board thread works.
-    // Holding `tx` keeps it running (it stops once no sender is left).
+#[cfg(target_os = "macos")]
+fn run_input_side(tx: Sender<Event>, _peer: Arc<Peer>) {
+    screen_macos::watch_edges(tx);
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn run_input_side(tx: Sender<Event>, _peer: Arc<Peer>) {
+    // Nothing to do on this OS: only the board thread works. Holding `tx`
+    // keeps it running (it stops once no sender is left).
     let _tx = tx;
     loop {
         thread::park();
     }
 }
 
-/// Keeps a connection to the board, forwarding input events and tracking the link.
-fn board_loop(rx: Receiver<Event>, link_up: Arc<AtomicBool>, wanted_port: Option<String>) {
+/// Keeps a connection to the board, forwarding events and tracking the link.
+fn board_loop(rx: Receiver<Event>, peer: Arc<Peer>, wanted_port: Option<String>) {
     loop {
-        link_up.store(false, Ordering::Relaxed);
+        peer.set_link_up(false);
         if let Some(port) = choose_board(wanted_port.as_deref()) {
             match Board::open(&port) {
                 Ok(mut board) => {
                     println!("Connected to the board on {port}");
-                    if serve(&mut board, &rx, &link_up).is_err() {
+                    if serve(&mut board, &rx, &peer).is_err() {
                         return; // the input side is gone: we are exiting
                     }
                     println!("Lost the board on {port}; waiting for it to come back...");
@@ -78,52 +93,73 @@ fn board_loop(rx: Receiver<Event>, link_up: Arc<AtomicBool>, wanted_port: Option
                 Err(e) => println!("Could not open {port}: {e}"),
             }
         }
-        link_up.store(false, Ordering::Relaxed);
+        peer.set_link_up(false);
         // Drop input that piled up while there was no board.
         while rx.try_recv().is_ok() {}
         sleep(POLL_INTERVAL);
     }
 }
 
-/// Forwards events until the board stops answering (Ok) or the input
-/// thread is gone (Err).
-fn serve(board: &mut Board, rx: &Receiver<Event>, link_up: &AtomicBool) -> Result<(), ()> {
-    let mut last_poll = Instant::now() - POLL_INTERVAL;
+/// Forwards events and handles what the board sends, until the board
+/// stops answering (Ok) or the input side is gone (Err).
+fn serve(board: &mut Board, rx: &Receiver<Event>, peer: &Peer) -> Result<(), ()> {
+    let mut last_request = Instant::now() - POLL_INTERVAL;
+    let mut last_reply = Instant::now();
     let mut last_status = Instant::now();
     let mut last_link: Option<bool> = None;
+    let mut last_handoff: Option<u8> = None;
+    let mut peer_daemon = false;
     loop {
-        if last_poll.elapsed() >= POLL_INTERVAL {
-            last_poll = Instant::now();
-            match board.request_stats(Duration::from_secs(1)) {
-                Ok(s) => {
-                    link_up.store(s.link_up, Ordering::Relaxed);
-                    if last_link != Some(s.link_up) || last_status.elapsed() >= STATUS_INTERVAL {
-                        last_link = Some(s.link_up);
-                        last_status = Instant::now();
-                        println!(
-                            "[link] {} @ {} | session {} | sent {} (resent {}, gave up {}) | frames failed {}/{}",
-                            if s.link_up { "UP" } else { "DOWN" },
-                            protocol::phy_rate_name(s.phy_rate),
-                            s.session,
-                            s.radio_sent,
-                            s.radio_retransmits,
-                            s.radio_gave_up,
-                            s.frames_failed,
-                            s.frames_acked + s.frames_failed,
-                        );
+        if peer_daemon != peer.daemon_alive() {
+            peer_daemon = !peer_daemon;
+            println!(
+                "[peer] the other computer's daemon {}",
+                if peer_daemon { "is running" } else { "is not answering" }
+            );
+        }
+        if last_request.elapsed() >= POLL_INTERVAL {
+            last_request = Instant::now();
+            if let Err(e) = board.request_stats() {
+                return board_lost(e);
+            }
+        }
+        if last_reply.elapsed() >= BOARD_TIMEOUT {
+            println!("The board stopped answering.");
+            return Ok(());
+        }
+
+        let packets = match board.receive() {
+            Ok(packets) => packets,
+            Err(e) => return board_lost(e),
+        };
+        for packet in packets {
+            if packet[2] == msg::DAEMON_STATUS {
+                last_reply = Instant::now();
+                let s = match LinkStats::parse(&packet) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("Board error: {e}");
+                        continue;
                     }
+                };
+                peer.set_link_up(s.link_up);
+                if last_link != Some(s.link_up) || last_status.elapsed() >= STATUS_INTERVAL {
+                    last_link = Some(s.link_up);
+                    last_status = Instant::now();
+                    print_link(&s);
                 }
-                Err(e) => {
-                    println!("Board error: {e}");
-                    return Ok(());
+            } else if let Some(m) = PeerMsg::decode(&packet) {
+                peer.heard();
+                if let Err(e) = on_peer_message(board, peer, m, &mut last_handoff) {
+                    return board_lost(e);
                 }
             }
         }
-        match rx.recv_timeout(Duration::from_millis(50)) {
+
+        match rx.recv_timeout(IDLE_WAIT) {
             Ok(event) => {
                 if let Err(e) = send_event(board, event) {
-                    println!("Board error: {e}");
-                    return Ok(());
+                    return board_lost(e);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -132,7 +168,65 @@ fn serve(board: &mut Board, rx: &Receiver<Event>, link_up: &AtomicBool) -> Resul
     }
 }
 
-/// Encodes one input event as a protocol packet (little-endian fields).
+fn board_lost(e: std::io::Error) -> Result<(), ()> {
+    println!("Board error: {e}");
+    Ok(())
+}
+
+fn print_link(s: &LinkStats) {
+    println!(
+        "[link] {} @ {} | session {} | sent {} (resent {}, gave up {}) | frames failed {}/{}",
+        if s.link_up { "UP" } else { "DOWN" },
+        protocol::phy_rate_name(s.phy_rate),
+        s.session,
+        s.radio_sent,
+        s.radio_retransmits,
+        s.radio_gave_up,
+        s.frames_failed,
+        s.frames_acked + s.frames_failed,
+    );
+}
+
+/// A message from the other computer's daemon.
+fn on_peer_message(board: &mut Board, peer: &Peer, m: PeerMsg, last_handoff: &mut Option<u8>) -> std::io::Result<()> {
+    match m {
+        PeerMsg::EdgeContact { edges, position } => peer.set_contact(edges, position),
+        PeerMsg::Handoff { edge, id, position } => {
+            // A repeat (its acknowledgement was lost on the radio) is only
+            // acknowledged again: the pointer may have moved since.
+            let accepted = if *last_handoff == Some(id) {
+                true
+            } else {
+                *last_handoff = Some(id);
+                let accepted = enter_screen(edge, position);
+                println!(
+                    "[peer] pointer handed over at {:.0}% height: {}",
+                    position as f64 / 655.35,
+                    if accepted { "placed" } else { "could not place it" }
+                );
+                accepted
+            };
+            send_event(board, Event::Peer(PeerMsg::HandoffAck { id, accepted }))?;
+        }
+        PeerMsg::HandoffAck { accepted: false, .. } => {
+            println!("[peer] the other computer could not place its pointer")
+        }
+        PeerMsg::HandoffAck { .. } => {}
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn enter_screen(edge: u8, position: u16) -> bool {
+    screen_macos::enter(edge, position)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn enter_screen(_edge: u8, _position: u16) -> bool {
+    false // not needed yet: only Windows hands the pointer over (Phase 4, step 3)
+}
+
+/// Encodes one event as a protocol packet (little-endian fields).
 fn send_event(board: &mut Board, event: Event) -> std::io::Result<()> {
     match event {
         Event::Key { usage, down, modifiers } => {
@@ -153,6 +247,11 @@ fn send_event(board: &mut Board, event: Event) -> std::io::Result<()> {
             board.send(msg::MOUSE_SCROLL, &p)
         }
         Event::ModifierSync(modifiers) => board.send(msg::MODIFIER_SYNC, &[modifiers]),
+        Event::Peer(m) => {
+            let (msg_type, payload) = m.encode();
+            debug_assert!(payload.len() <= PACKET_SIZE - protocol::HEADER_SIZE);
+            board.send(msg_type, &payload)
+        }
     }
 }
 

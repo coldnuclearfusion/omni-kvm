@@ -31,6 +31,7 @@ enum MsgType : uint8_t {
     MSG_INPUT_ACK        = 0x06,   // receiver -> sender: "input packet <seq> processed"
     MSG_HANDOFF          = 0x10,
     MSG_HANDOFF_ACK      = 0x11,
+    MSG_EDGE_CONTACT     = 0x12,   // daemon to daemon; relayed, never read by the firmware
     MSG_HEARTBEAT        = 0x20,
     MSG_HEARTBEAT_ACK    = 0x21,
     MSG_SESSION_HELLO    = 0x22,

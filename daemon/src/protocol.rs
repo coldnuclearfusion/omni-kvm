@@ -16,6 +16,10 @@ pub mod msg {
     pub const KEY_DOWN: u8 = 0x03;
     pub const KEY_UP: u8 = 0x04;
     pub const MODIFIER_SYNC: u8 = 0x05;
+    // Between the two daemons, relayed by the boards (see peer.rs).
+    pub const HANDOFF: u8 = 0x10;
+    pub const HANDOFF_ACK: u8 = 0x11;
+    pub const EDGE_CONTACT: u8 = 0x12;
     pub const DAEMON_CMD: u8 = 0x40;
     pub const DAEMON_STATUS: u8 = 0x41;
 }

@@ -60,6 +60,7 @@ Value  Name                  Direction       Description
 
 0x10   MSG_HANDOFF           either → either Cursor control transfer request
 0x11   MSG_HANDOFF_ACK       either → either Confirms handoff accepted
+0x12   MSG_EDGE_CONTACT      sink → source   Which screen edges the pointer touches
 
 0x20   MSG_HEARTBEAT         both ↔ both     Keepalive ping
 0x21   MSG_HEARTBEAT_ACK     both ↔ both     Keepalive pong
@@ -170,32 +171,55 @@ Sent by the receiving board after it has **processed** an input packet that carr
 
 ### MSG_HANDOFF (0x10)
 
+"The pointer is now on your screen." Sent by the daemon whose keyboard and mouse are in use, when the pointer crosses to the other screen.
+
 ```
 Offset  Size  Field       Description
 ──────  ────  ──────────  ────────────────────────────────────────
-8       1     edge        Which edge the cursor exited from:
+8       1     edge        Which edge of the sender's screen the pointer left by:
                           0x01=right, 0x02=left, 0x03=top, 0x04=bottom
-9       1     reserved    0x00
-10      2     entry_x     Suggested entry X on the receiving side (uint16, pixels)
-12      2     entry_y     Suggested entry Y on the receiving side (uint16, pixels)
-14      2     exit_y      Y coordinate where cursor left the source screen (uint16)
-                          (useful if receiver wants to compute its own entry point)
-16      1     modifiers   Current modifier state at the moment of handoff
-17      47    (padding)   Zero-filled
+9       1     id          Handoff counter (wraps), so a repeat can be recognized
+10      2     position    Where along that edge, as a fraction (uint16):
+                          0 = top (or left end), 65535 = bottom (or right end)
+12      52    (padding)   Zero-filled
 ```
 
-The entry coordinates are **absolute pixel positions on the receiving side's monitor space**. They are computed by the sending daemon based on the negotiated virtual desktop layout. The receiving daemon may adjust them if the layout has changed since last negotiation.
+The receiver puts its pointer just inside the opposite edge (the Mac: 20 points in from its left edge when Windows sends 0x01), at the same fraction of its height, and answers `MSG_HANDOFF_ACK`. A repeated `id` (the handoff was retransmitted) is acknowledged again but not applied, since the pointer may have moved since.
+
+**Why a fraction.** The draft layout carried absolute entry coordinates computed from a negotiated monitor layout. A fraction needs no negotiation, keeps working when either side changes resolution, and lines up screens of different sizes by proportion ("40% of the way down" on both).
+
+If the receiving daemon is not running, nothing answers. The sending daemon only sends `MSG_HANDOFF` when it has heard from the other daemon in the last 3 seconds (see `MSG_EDGE_CONTACT`); otherwise it falls back to a large leftward mouse movement, which pins the other pointer to its left edge at whatever height it was.
 
 ### MSG_HANDOFF_ACK (0x11)
 
 ```
 Offset  Size  Field       Description
 ──────  ────  ──────────  ────────────────────────────────────────
-8       1     accepted    0x01 = accepted, 0x00 = rejected (e.g. locked)
-9       55    (padding)   Zero-filled
+8       1     accepted    0x01 = accepted, 0x00 = rejected (e.g. locked,
+                          or the pointer could not be placed)
+9       1     id          The id of the MSG_HANDOFF being answered
+10      54    (padding)   Zero-filled
 ```
 
-If rejected (e.g. full-screen lock active on the receiving side), the sending daemon keeps the cursor and shows a visual indicator to the user.
+If rejected, the sending daemon reports it. (Planned: with a full-screen lock on the receiving side, the sender keeps the pointer and shows a visual indicator.)
+
+### MSG_EDGE_CONTACT (0x12)
+
+"My pointer is touching these screen edges." Sent by the daemon of the screen the pointer is on while the other computer's keyboard and mouse drive it, so the other daemon can tell when the user pushes past an edge. The pointer's position alone cannot show that: at the edge it stops moving, while the mouse keeps sending movement that only the other daemon sees.
+
+```
+Offset  Size  Field       Description
+──────  ────  ──────────  ────────────────────────────────────────
+8       1     edges       Bit 0: right, bit 1: left, bit 2: top, bit 3: bottom
+9       1     reserved    0x00
+10      2     position    Pointer height as a fraction of the screen (uint16,
+                          as in MSG_HANDOFF), meaningful while touching left/right
+12      52    (padding)   Zero-filled
+```
+
+Sent when `edges` changes, when `position` changes while touching an edge, and at least once a second. The once-a-second repeat also tells the other daemon this one is running; after 3 seconds of silence it counts as stopped.
+
+On the other side, while its input goes to this screen, the daemon adds up the mouse's movement towards a touched edge; past the same resistance as on its own screen, it takes the pointer back and places its own pointer at `position` along the facing edge. (The Mac checks its pointer every 10 ms.)
 
 ### MSG_HEARTBEAT (0x20) / MSG_HEARTBEAT_ACK (0x21)
 
@@ -323,7 +347,7 @@ Sealed (on the air):
 
 - **Keys**: 256-bit. `MSG_SESSION_HELLO` is sealed with the long-term key; everything else with the current session key derived from it (see [Sessions](#sessions)). Until pairing exists (Phase 5), both boards are built with the same development long-term key from `firmware/include/secrets/dev_key.h`, generated by `tools/make_dev_key.py` and never committed.
 - **Nonce**: 12 bytes from the ESP32-S3 hardware random number generator (truly random while Wi-Fi is on). ChaCha20-Poly1305 is catastrophically broken if a nonce repeats under the same key; random nonces stay unique across reboots and between the two boards, which share the key.
-- **Message size limit**: sealed packets carry at most 28 bytes of message data. Every radio message defined above fits (the largest, `MSG_HANDOFF`, uses 9).
+- **Message size limit**: sealed packets carry at most 28 bytes of message data. Every radio message defined above fits (the largest, `MSG_SESSION_HELLO`, uses 25).
 - **Header**: sent in plaintext because the receiver reads it first, but any change to it (type, flags, seq) makes the tag fail.
 
 ### Why not AES-128-CTR

@@ -4,8 +4,10 @@
 //! Pushing the pointer past the right edge of the screen (with some
 //! "virtual resistance") switches to **Remote** mode: keyboard and mouse
 //! input is swallowed, so Windows never sees it, and forwarded to the
-//! board as protocol events. Scroll Lock toggles between the two, and a
-//! lost radio link falls back to Local.
+//! board as protocol events. If the Mac's daemon is running, a handoff
+//! puts the Mac pointer at the same height, and pushing it past the Mac's
+//! left edge comes back. Scroll Lock toggles between the two modes, and
+//! a lost radio link falls back to Local.
 //!
 //! Mouse movement comes from Raw Input: the counts the mouse reported,
 //! before Windows pointer acceleration, because the Mac applies its own
@@ -18,7 +20,6 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -32,10 +33,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::input::Event;
 use crate::keymap;
+use crate::peer::{self, Peer, PeerMsg};
 
-/// Raw mouse counts pushed against the right edge before switching.
+/// Raw mouse counts pushed against an edge before switching.
 const EDGE_RESISTANCE: i32 = 60;
-/// Sent on entering Remote, so the Mac pointer starts at its left edge.
+/// Sent on entering Remote when the Mac has no daemon to place its
+/// pointer, so it at least starts somewhere on the left edge.
 const SLAM_LEFT: i32 = -5000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +50,14 @@ enum Mode {
 struct State {
     mode: Mode,
     tx: Sender<Event>,
-    link_up: Arc<AtomicBool>,
+    peer: Arc<Peer>,
+    handoff_id: u8,
     // Local mode
     local_keys: HashSet<u32>, // virtual-key codes held on Windows
     local_buttons: u8,
     edge_push: i32,
+    // Remote mode: pushing past the Mac's left edge
+    return_push: i32,
     // Remote mode
     keys_held_at_switch: HashSet<u32>, // their key-up must still reach Windows
     buttons_held_at_switch: u8,
@@ -97,7 +103,7 @@ impl State {
     }
 
     fn enter_remote(&mut self) {
-        if !self.link_up.load(Ordering::Relaxed) {
+        if !self.peer.link_up() {
             println!("[input] radio link is down; staying on Windows");
             return;
         }
@@ -109,13 +115,26 @@ impl State {
         self.buttons = 0;
         self.wheel = 0;
         self.hwheel = 0;
+        self.return_push = 0;
         self.entry_y = cursor_pos().y;
-        self.send(Event::Mouse { dx: SLAM_LEFT, dy: 0, buttons: 0 });
-        println!("[input] -> Mac  (Scroll Lock to come back)");
+        if self.peer.daemon_alive() {
+            // The Mac pointer moves away from wherever it was: forget any
+            // edge it touched until the Mac reports again.
+            self.peer.set_contact(0, 0);
+            self.handoff_id = self.handoff_id.wrapping_add(1);
+            let (_, top, _, bottom) = virtual_screen();
+            let position = peer::fraction(self.entry_y as f64, top as f64, bottom as f64);
+            self.send(Event::Peer(PeerMsg::Handoff { edge: peer::EDGE_RIGHT, id: self.handoff_id, position }));
+            println!("[input] -> Mac  (push past its left edge, or Scroll Lock, to come back)");
+        } else {
+            self.send(Event::Mouse { dx: SLAM_LEFT, dy: 0, buttons: 0 });
+            println!("[input] -> Mac  (Scroll Lock to come back; start the Mac daemon to use its left edge)");
+        }
     }
 
-    /// Releases everything held on the remote side and gives input back to Windows.
-    fn leave_remote(&mut self, why: &str) -> After {
+    /// Releases everything held on the remote side and gives input back to
+    /// Windows, with the pointer at height `y` (default: where it left).
+    fn leave_remote(&mut self, why: &str, y: Option<i32>) -> After {
         for &usage in &self.remote_keys {
             self.send(Event::Key { usage, down: false, modifiers: 0 });
         }
@@ -130,12 +149,12 @@ impl State {
         self.edge_push = 0;
         println!("[input] <- Windows ({why})");
         let (_, _, right, _) = virtual_screen();
-        After::MoveCursor(right - 40, self.entry_y) // a little away from the edge
+        After::MoveCursor(right - 40, y.unwrap_or(self.entry_y)) // a little away from the edge
     }
 
     fn check_link(&mut self) -> After {
-        if self.mode == Mode::Remote && !self.link_up.load(Ordering::Relaxed) {
-            return self.leave_remote("radio link lost");
+        if self.mode == Mode::Remote && !self.peer.link_up() {
+            return self.leave_remote("radio link lost", None);
         }
         After::Nothing
     }
@@ -150,7 +169,7 @@ impl State {
                         self.enter_remote();
                         After::Nothing
                     }
-                    Mode::Remote => self.leave_remote("Scroll Lock"),
+                    Mode::Remote => self.leave_remote("Scroll Lock", None),
                 };
             }
             self.scroll_lock_held = down;
@@ -256,6 +275,24 @@ impl State {
             self.send(Event::Mouse { dx, dy, buttons: self.buttons });
         }
 
+        // Pushing past the Mac's left edge: the Mac daemon reports when its
+        // pointer touches the edge, and further leftward counts build up
+        // to the same resistance as on the way over.
+        if let Some(position) = self.peer.touching(peer::CONTACT_LEFT) {
+            if dx < 0 {
+                self.return_push -= dx;
+                if self.return_push >= EDGE_RESISTANCE {
+                    let (_, top, _, bottom) = virtual_screen();
+                    let y = peer::from_fraction(position, top as f64, bottom as f64).round() as i32;
+                    return self.leave_remote("Mac's left edge", Some(y));
+                }
+            } else if dx > 0 {
+                self.return_push = 0;
+            }
+        } else {
+            self.return_push = 0;
+        }
+
         // Wheel: WHEEL_DELTA (120) per notch; high-resolution wheels send less.
         let (mut vertical, mut horizontal) = (0i16, 0i16);
         if flags & RI_MOUSE_WHEEL != 0 {
@@ -356,15 +393,17 @@ fn wide(s: &str) -> Vec<u16> {
 /// Installs the hooks and runs the message loop on the calling thread,
 /// which must be the thread that keeps pumping messages. Never returns
 /// normally; the hooks disappear with the process.
-pub fn run(tx: Sender<Event>, link_up: Arc<AtomicBool>) -> Result<(), String> {
+pub fn run(tx: Sender<Event>, peer: Arc<Peer>) -> Result<(), String> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             mode: Mode::Local,
             tx,
-            link_up,
+            peer,
+            handoff_id: 0,
             local_keys: HashSet::new(),
             local_buttons: 0,
             edge_push: 0,
+            return_push: 0,
             keys_held_at_switch: HashSet::new(),
             buttons_held_at_switch: 0,
             remote_keys: HashSet::new(),
