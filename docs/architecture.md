@@ -75,7 +75,7 @@ The firmware is intentionally minimal. It does not understand cursor positions, 
 The daemon is where all user-facing logic lives. It is the only component that understands what it means for the cursor to "leave one screen and enter another".
 
 **Owns:**
-- Hooking the OS input stream (Raw Input on Windows, CGEventTap on macOS)
+- Hooking the OS input stream (Raw Input on Windows, CGEventTap on macOS). Mouse deltas must be captured *before* the local OS applies pointer acceleration: the receiving OS accelerates the injected HID reports again, and forwarding already-accelerated movement would accelerate it twice. On Windows, Raw Input provides the un-accelerated counts. See the batching note in `shared/protocol.md` for the measured effect of acceleration.
 - Querying and tracking the local monitor layout
 - Negotiating the shared virtual desktop with the peer daemon
 - Deciding when to hand off control (virtual resistance, edge detection)

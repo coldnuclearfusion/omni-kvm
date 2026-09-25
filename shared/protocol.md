@@ -263,6 +263,15 @@ ESP-NOW theoretical throughput is ~1 Mbps. Our peak load of ~67 KB/s (~540 kbps)
 
 In practice, mouse reports will be batched: if multiple deltas accumulate between radio transmissions, they are summed into a single packet. The firmware targets a radio transmission interval of 1 ms, matching the USB HID polling rate.
 
+**Keep batching windows short.** The receiving OS applies pointer acceleration to each report based on its size and the recent movement history, so one large delta does not move the pointer as far as the same motion delivered in small steps. Measured in Phase 1 on Windows with "Enhance pointer precision" on (the default), sending 150 counts per side of a square:
+
+| Delivery | Pointer movement per side | Square closes? |
+|---|---|---|
+| One 150-count report per side | 236, 360, 360, 360 px | No, off by 124 px |
+| 30 × 5-count reports, 8 ms apart | 123, 123, 123, 123 px | Yes, exactly |
+
+A few deltas summed within ~1 ms is harmless, since a real mouse reports at that rate anyway. But a backlog that builds up during a radio stall must be replayed as small steps over time, not summed into one jump.
+
 ## Future extensions
 
 The `version` field and reserved bits in `flags` allow backward-compatible extensions:
