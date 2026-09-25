@@ -25,9 +25,9 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 
 **Threat**: Attacker records encrypted packets and retransmits them later to cause unintended keystrokes or mouse movements on the victim's computer.
 
-**Mitigation**: Monotonically increasing 32-bit sequence numbers. Receiver drops any authentic packet with seq ≤ last seen. The sequence number is in the header, which the authentication tag covers, so it cannot be changed without detection. Re-key on sequence wrap.
+**Mitigation**: Two layers. (1) Per-connection session keys: every link-up derives a fresh key from both boards' random nonces, so packets recorded in an earlier session fail authentication. (2) Within a session, monotonically increasing 32-bit sequence numbers: the receiver drops any authentic packet with seq ≤ last seen. The sequence number is in the header, which the authentication tag covers, so it cannot be changed without detection. A new session on sequence wrap.
 
-**Residual risk (current firmware)**: After 3 seconds without an authentic packet, the receiver accepts the peer's sequence number afresh so a rebooted peer can reconnect. An attacker who records traffic and then jams the channel for 3 seconds could replay the recording during that window. Planned fix: per-connection session keys, under which old recordings fail authentication (see `security.md`). **Risk level: medium until session keys ship, then none (if implemented correctly).**
+**Residual risk**: None known, assuming correct implementation. An earlier firmware reset the sequence check after 3 s of link loss (record, jam for 3 s, replay); session keys removed that gap. Both layers were exercised on hardware with a test build that replays recorded packets (within a session: dropped as a replay; into a later session: failed authentication). **Risk level: none (if implemented correctly).**
 
 ### T3 — Man-in-the-middle during pairing
 
@@ -121,7 +121,7 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 | Threat | Mitigated? | Residual Risk |
 |---|---|---|
 | T1 Eavesdropping | Yes | Very low |
-| T2 Replay | Partly (gap until session keys) | Medium, then none |
+| T2 Replay | Yes (session keys + sequence numbers) | None |
 | T3 MITM pairing | Mostly | Low |
 | T4 Rogue device | Yes | Very low |
 | T5 Jamming | Graceful degradation | Low |

@@ -59,7 +59,7 @@ The firmware is intentionally minimal. It does not understand cursor positions, 
 - Pacing HID reports: a minimum gap between reports, and modifier changes (Shift, Ctrl, …) sent before the key they apply to. In Phase 1 testing, key reports sent ~1 ms apart came out garbled on Windows (dropped letters, Shift on the wrong keys), so bursts arriving from the radio must not be injected back-to-back. The minimum safe gap is still to be measured against the latency budget.
 - Receiving commands from daemon over CDC → encoding and transmitting over radio
 - ESP-NOW peer setup, retransmits, and heartbeat
-- Authenticated encryption (ChaCha20-Poly1305) and replay protection (sequence numbers)
+- Authenticated encryption (ChaCha20-Poly1305), per-connection session keys, and replay protection (sequence numbers)
 - Local fail-safe (e.g. release stuck modifier keys when peer goes silent)
 - USB Mass Storage with installer payloads
 - DFU mode entry for daemon-mediated firmware updates

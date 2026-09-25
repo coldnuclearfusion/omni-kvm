@@ -51,7 +51,7 @@ Total parts cost: roughly KRW 65,000 / USD 50.
 
 Wireless input is a sensitive channel. The threat model and mitigations are documented in `docs/security.md` and `docs/threat-model.md`. Summary:
 
-- Authenticated encryption (ChaCha20-Poly1305) on every radio packet, with sequence numbers for replay protection
+- Authenticated encryption (ChaCha20-Poly1305) on every radio packet, with a fresh session key per connection and sequence numbers for replay protection
 - MAC-address-based peer filtering after a one-time pairing
 - Devices never connect to the internet; firmware updates are mediated by the host daemon
 - Factory reset requires physical button press
