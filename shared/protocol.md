@@ -56,6 +56,7 @@ Value  Name                  Direction       Description
 0x03   MSG_KEY_DOWN          source → sink   Key press
 0x04   MSG_KEY_UP            source → sink   Key release
 0x05   MSG_MODIFIER_SYNC     source → sink   Full modifier state snapshot
+0x06   MSG_INPUT_ACK         sink → source   "Input packet <seq> processed"
 
 0x10   MSG_HANDOFF           either → either Cursor control transfer request
 0x11   MSG_HANDOFF_ACK       either → either Confirms handoff accepted
@@ -145,6 +146,17 @@ Offset  Size  Field       Description
 
 Sent periodically (every ~500 ms) and on every handoff to prevent stuck modifiers. Also sent when the link recovers from disconnection.
 
+### MSG_INPUT_ACK (0x06)
+
+```
+Offset  Size  Field       Description
+──────  ────  ──────────  ────────────────────────────────────────
+8       4     seq         Header seq of the input packet being acknowledged (uint32)
+12      52    (padding)   Zero-filled
+```
+
+Sent by the receiving board after it has **processed** an input packet that carried `ACK_REQUESTED`. See [Sequencing and reliability](#sequencing-and-reliability).
+
 ### MSG_HANDOFF (0x10)
 
 ```
@@ -226,8 +238,9 @@ Offset  Size  Field       Description
                           0x03 = request firmware version
                           0x04 = request link statistics → MSG_DAEMON_STATUS 0x03
                           0x05 = (reserved, see note) trigger pairing mode
-                          0x06 = development: set radio TX window
-                                 (data[0] = most input frames in flight, 0 = no limit)
+                          0x06 = (retired: set radio TX window)
+                          0x07 = development: set radio TX rate
+                                 (data[0] = ESP-IDF wifi_phy_rate_t, e.g. 0x0A = 12 Mbps)
 9       55    (data)      Sub-command-specific data
 ```
 
@@ -251,28 +264,29 @@ Offset  Size  Field       Description
 
 Also local-only (firmware → daemon over USB CDC).
 
-**Link statistics (status 0x03)**, counters since boot, little-endian (`proto::LinkStats` in `firmware/include/protocol.h`; `tools/hid_test.py stats` prints them):
+**Link statistics (status 0x03)**, counters since boot, little-endian (`proto::LinkStats` in `firmware/include/protocol.h`; `tools/hid_test.py stats` and the daemon print them):
 
 ```
 Offset  Size  Field               Description
 ──────  ────  ──────────────────  ────────────────────────────────────────
 8       1     status_id           0x03
-9       1     layout              Layout version of this block (currently 2)
+9       1     layout              Layout version of this block (currently 3)
 10      1     link_up             1 while the radio link is up
-11      4     session             Session generation (0 = none yet)
-15      4     host_received       Input packets from this board's host
-19      4     host_dropped        ...not queued for the radio (link down, queue full)
-23      4     radio_sent          Input packets handed to ESP-NOW
-27      4     radio_send_retries  ESP-NOW was busy; sent again later
-31      4     radio_received      Authentic input packets from the peer
-35      4     radio_rx_overflow   Radio packets lost: receive queue full
-39      4     auth_failures       Radio packets whose tag did not verify
-43      4     replays_dropped     Authentic packets with an old sequence number
-47      4     frames_sent         All radio frames accepted by ESP-NOW (incl. heartbeats)
-51      4     frames_acked        ...acknowledged by the peer at the MAC layer
-55      4     frames_failed       ...not acknowledged, even after MAC retries
-59      2     hid_stalls          Keyboard output had to wait for USB (saturates)
-63      2     hid_mouse_dropped   Mouse reports dropped, USB not ready (saturates)
+11      1     phy_rate            Current radio TX rate (ESP-IDF wifi_phy_rate_t)
+12      4     session             Session generation (0 = none yet)
+16      4     host_received       Input packets from this board's host
+20      4     host_dropped        ...not queued for the radio (link down, queue full)
+24      4     radio_sent          Input packets handed to ESP-NOW, retransmissions included
+28      4     radio_retransmits   Input packets sent again: no MSG_INPUT_ACK in time
+32      4     radio_gave_up       Input packets never acknowledged after every attempt
+36      4     radio_received      Authentic input packets from the peer
+40      4     radio_rx_overflow   Radio packets lost: receive queue full
+44      4     auth_failures       Radio packets whose tag did not verify
+48      4     replays_dropped     Authentic packets with an old sequence number
+52      4     frames_acked        Radio frames (incl. heartbeats) acknowledged by the peer's radio
+56      4     frames_failed       ...not acknowledged, even after MAC retries
+60      2     hid_stalls          Keyboard output had to wait for USB (saturates)
+62      2     hid_mouse_dropped   Mouse reports dropped, USB not ready (saturates)
 ```
 
 Readers must check `layout` and refuse unknown values rather than misread the counters.
@@ -366,8 +380,10 @@ ESP-NOW provides a basic ACK at the MAC layer, but we add application-level sequ
 
 1. **Replay protection**: Receiver maintains `last_seen_seq` per peer and session. Any authentic packet with `seq <= last_seen_seq` is dropped. The counter restarts only with a new session, whose new key makes packets from earlier sessions fail authentication (see [Sessions](#sessions)).
 2. **Ordering**: Input events must be applied in order. If packet N+1 arrives before N, the receiver buffers N+1 briefly (up to 5 ms) waiting for N. If N doesn't arrive, N+1 is applied and N is considered lost.
-3. **Selective retransmit**: For critical messages (HANDOFF, PAIR_*, LOCK/UNLOCK), the sender sets `ACK_REQUESTED`. If no application-level ACK arrives within 10 ms, the sender retransmits up to 3 times.
-4. **Input events are not retransmitted**: Mouse movements and key events are time-sensitive. A 10 ms-old mouse delta is worse than a dropped one (it causes a delayed "jump"). If lost, the next event naturally corrects the state. Modifier sync provides additional self-healing.
+3. **Acknowledged input**: key events, modifier syncs, and mouse moves that change the button state go out with `ACK_REQUESTED`. The receiving board applies the packet, then answers `MSG_INPUT_ACK{seq}`. The sender keeps at most one such packet outstanding and sends nothing queued after it until it is acknowledged, retransmitting it (with a new sequence number) if no acknowledgement arrives within 25 ms, up to 6 attempts in total. This preserves order, so the peer never sees "key up" before a late "key down", and a lost acknowledgement is harmless: the copy is applied again, and input messages carry state ("key A is down"), not toggles. The same mechanism will serve HANDOFF, PAIR_*, LOCK/UNLOCK.
+4. **Plain mouse movement is not acknowledged or retransmitted**: a 10 ms-old delta is worse than a dropped one (it makes the pointer jump), and the next movement corrects the position anyway.
+
+**Why end-to-end.** ESP-NOW already retries at the MAC layer and reports each frame as delivered or failed, but "delivered" only means the peer's radio received it. A first version resent key events when ESP-NOW reported a failure, matching reports to frames in send order; a key was still lost with every frame reported delivered. With `MSG_INPUT_ACK`, a line typed into a Mac at 24 Mbps from the worst spot, with 20% of frames failing, arrived intact after 27 retransmissions.
 
 ## Rate and bandwidth
 
@@ -391,12 +407,11 @@ A few deltas summed within ~1 ms is harmless, since a real mouse reports at that
 **Bursts from the host.** Measured in Phase 2 with the test tool sending a whole line of text (70–76 packets) or a mouse square (120 packets) at once, with the link statistics above read before and after:
 
 - A 64-packet radio send queue silently dropped the tail of a 70-packet burst (the last three characters). Fixed: the queue holds 128 packets and the firmware stops reading from USB while it is full, so a burst waits in the 4 KB USB receive buffer instead.
-- Over six runs (~1,600 input packets each way combined), one packet was lost in the air (reported by ESP-NOW as not acknowledged). Limiting frames in flight to 1 or 4 made no measurable difference, so the default is no limit. One earlier run lost 37 of 190 packets in one direction; it did not reproduce, and the new `frames_failed` / `radio_rx_overflow` counters will show where such losses happen if they recur.
-- Keystrokes are not yet retransmitted when ESP-NOW reports a failed frame; a lost key event means a missing or stuck key until the next event. Retransmitting key events (they are state-based, so a duplicate is harmless) is a candidate improvement.
+- With both boards on one desk, over six runs (~1,600 input packets), one packet was lost in the air, and limiting frames in flight to 1 or 4 made no measurable difference. With one board next to a MacBook the picture changed completely (see [Radio settings](#radio-settings)), which led to acknowledged input (above) and a lower PHY rate.
 
 ## Radio settings
 
-Both boards must use the same channel. Current defaults (in `firmware/src/radio_link.cpp`, overridable with build flags): **channel 6, PHY rate 24 Mbps**.
+Both boards must use the same channel. Current defaults (in `firmware/src/radio_link.cpp`, overridable with build flags; the rate also at run time with `MSG_DAEMON_CMD` 0x07): **channel 6, PHY rate 12 Mbps**. The first experiment below picked 24 Mbps; the second one, next to a laptop, moved the default down.
 
 They come from a Phase 2 jitter experiment: boards ~30 cm apart, ChaCha20-Poly1305 on, ~500 heartbeat RTT samples per configuration from both boards, changing one setting at a time. No heartbeat was lost in any configuration.
 
@@ -418,6 +433,28 @@ RTT in ms. Findings:
 - **Blocking serial logs and Wi-Fi sleep were not the cause** of the spikes (both hypotheses rejected; sleep-off even looked worse in this run, but one run is not enough to say it hurts).
 - **Channel differences were small** compared with the run-to-run variation on the same channel, and depend on the neighbours' Wi-Fi. Automatic channel selection is a possible future improvement.
 - **Distance check**: with the boards ~1.5–1.8 m apart, line of sight, no obstacles, 300 samples from one board: no losses, min 1.49, median 1.58, p90 3.29, p99 5.44, max 7.4 ms, 2% over 5 ms, i.e. no worse than at 30 cm. Not yet tested: through walls or at longer range.
+
+**Next to a laptop (Phase 3).** With board 1 on the Windows PC and board 2 on a MacBook Air ~1 m away, the link got much worse at 24 Mbps, and depended heavily on where board 2 lay. Frames failing (after MAC retries), board 1 → board 2:
+
+| Board 2 placement | 24 Mbps | 11 Mbps | 6 Mbps | 1 Mbps |
+|---|---|---|---|---|
+| A: first spot, beside the MacBook | 1.3% (earlier), 78.9% (later) | 0% | 0% | 0% |
+| B: away from the MacBook, a wired speaker between the boards | 9.2% | – | – | – |
+| C: away from the MacBook, antenna turned toward board 1 | 12.3–99.5% | 0% | 0% | 0% |
+
+The MacBook's own Wi-Fi was on 5 GHz (channel 40), so not a co-channel source. The physical layout mattered more than distance: a speaker in the line of sight, the orientation of the module's PCB antenna, possibly noise near the laptop. The same spot swung from 12% to 99% at 24 Mbps between runs.
+
+Then, at spot C, one 60-character line (120 acknowledged input packets) per rate, measuring the average time per acknowledged packet (it includes the test tool's polling overhead, so compare rates, not absolute values):
+
+| Rate | Time per acknowledged packet | Frames failed | Retransmissions | Given up |
+|---|---|---|---|---|
+| 24 Mbps | 9.97 ms | 20% | 27 | 0 |
+| 18 Mbps | 3.99 ms | 0% | 0 | 0 |
+| 12 Mbps | 4.30 ms | 0% | 0 | 0 |
+| 11 Mbps | 4.55 ms | 0% | 0 | 0 |
+| 6 Mbps | 4.55 ms | 0% | 0 | 0 |
+
+All five lines arrived intact. 24 Mbps is the slowest here because of retransmissions. 18 Mbps was the sweet spot at this spot, but it is only one step below a rate that failed, so the default is **12 Mbps**: more signal margin for ~0.3 ms per packet. The sweet spot differs by place, so **automatic rate adaptation** (step down on failures, probe upward when clean, as Wi-Fi access points do) is the proper long-term answer.
 
 ## Future extensions
 
