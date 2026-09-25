@@ -73,8 +73,7 @@ Wireless input is a sensitive channel. The threat model and mitigations are docu
 ```
 omni-kvm/
 ├── firmware/         ESP32-S3 firmware (PlatformIO project)
-├── daemon-windows/   Windows host daemon
-├── daemon-macos/     macOS host daemon
+├── daemon/           Host daemon (Rust): shared logic + per-OS modules (Windows, then macOS)
 ├── shared/           Shared protocol definitions and constants
 ├── tools/            Development and test utilities
 └── docs/             Architecture, protocol, security documentation

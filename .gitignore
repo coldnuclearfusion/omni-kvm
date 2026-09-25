@@ -49,7 +49,8 @@ dist/
 # ============================================================
 target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed on purpose: the daemon is an application, so
+# every build should use exactly the dependency versions we tested.
 
 # ============================================================
 # Python (build/release scripts, if any)

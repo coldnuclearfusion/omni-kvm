@@ -1,0 +1,21 @@
+[package]
+name = "omni-kvm-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Omni-KVM host daemon: talks to the local board over USB and (later) captures and forwards keyboard/mouse input"
+publish = false
+
+[[bin]]
+name = "omni-kvm"
+path = "src/main.rs"
+
+[dependencies]
+serialport = "4"
+
+[profile.release]
+# Small binaries matter: the installers are meant to fit on the board's
+# own flash (Phase 6).
+lto = true
+codegen-units = 1
+strip = true
