@@ -32,6 +32,7 @@ enum MsgType : uint8_t {
     MSG_HANDOFF_ACK      = 0x11,
     MSG_HEARTBEAT        = 0x20,
     MSG_HEARTBEAT_ACK    = 0x21,
+    MSG_SESSION_HELLO    = 0x22,
     MSG_PAIR_REQUEST     = 0x30,
     MSG_PAIR_CHALLENGE   = 0x31,
     MSG_PAIR_CONFIRM     = 0x32,
@@ -92,6 +93,18 @@ struct __attribute__((packed)) KeyEvent {
 struct __attribute__((packed)) ModifierSync {
     uint8_t modifiers;
 };
+
+// MSG_SESSION_HELLO: session handshake, sealed with the long-term key.
+// See shared/protocol.md ("Sessions").
+constexpr size_t SESSION_NONCE_SIZE = 12;
+constexpr uint8_t HELLO_FLAG_ESTABLISHED = 1 << 0;   // sender has derived the session key
+
+struct __attribute__((packed)) SessionHello {
+    uint8_t nonce[SESSION_NONCE_SIZE];   // sender's handshake nonce
+    uint8_t echo[SESSION_NONCE_SIZE];    // latest nonce received from the peer (zeros if none)
+    uint8_t flags;
+};
+static_assert(sizeof(SessionHello) <= SEALED_DATA_SIZE, "HELLO must fit in a sealed packet");
 
 // Used by both MSG_HEARTBEAT and MSG_HEARTBEAT_ACK. The ACK echoes the
 // heartbeat's timestamp so the original sender can compute the RTT.

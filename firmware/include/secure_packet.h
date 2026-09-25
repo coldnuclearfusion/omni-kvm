@@ -36,18 +36,16 @@ constexpr unsigned KEY_SIZE = 32;   // 256-bit ChaCha20 key
 // Human-readable name of the compiled-in cipher, for logs.
 const char *modeName();
 
-// Sets the key. Call once, after the radio is on (the hardware random
-// number generator is only truly random while Wi-Fi is running).
-void begin(const uint8_t key[KEY_SIZE]);
+// Encrypts a 64-byte plaintext packet in place with `key` and sets
+// FLAG_ENCRYPTED. Returns false if the message data doesn't fit in
+// SEALED_DATA_SIZE bytes (the rest of the payload must be zero).
+// Only call while the radio is on: the hardware random number
+// generator used for nonces is only truly random while Wi-Fi runs.
+bool seal(uint8_t *packet, const uint8_t key[KEY_SIZE]);
 
-// Encrypts a 64-byte plaintext packet in place and sets FLAG_ENCRYPTED.
-// Returns false if the message data doesn't fit in SEALED_DATA_SIZE
-// bytes (the rest of the payload must be zero).
-bool seal(uint8_t *packet);
-
-// Verifies and decrypts a sealed 64-byte packet in place, and clears
-// FLAG_ENCRYPTED. Returns false if the tag doesn't match: the packet
-// was altered, corrupted, or sealed with a different key.
-bool open(uint8_t *packet);
+// Verifies and decrypts a sealed 64-byte packet in place with `key`,
+// and clears FLAG_ENCRYPTED. Returns false if the tag doesn't match:
+// the packet was altered, corrupted, or sealed with a different key.
+bool open(uint8_t *packet, const uint8_t key[KEY_SIZE]);
 
 }  // namespace secure_packet

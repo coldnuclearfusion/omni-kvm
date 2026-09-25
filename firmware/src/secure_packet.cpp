@@ -18,8 +18,6 @@ namespace secure_packet {
 
 static const size_t FLAGS_OFFSET = offsetof(proto::Header, flags);
 
-static uint8_t key[KEY_SIZE];
-
 const char *modeName() {
     switch (OMNI_RADIO_CRYPTO) {
         case OMNI_CRYPTO_NONE:       return "none (benchmark)";
@@ -29,11 +27,7 @@ const char *modeName() {
     }
 }
 
-void begin(const uint8_t newKey[KEY_SIZE]) {
-    memcpy(key, newKey, KEY_SIZE);
-}
-
-bool seal(uint8_t *packet) {
+bool seal(uint8_t *packet, const uint8_t key[KEY_SIZE]) {
 #if OMNI_RADIO_CRYPTO != OMNI_CRYPTO_CHACHAPOLY
     return true;    // benchmark: leave the packet as plaintext
 #else
@@ -65,7 +59,7 @@ bool seal(uint8_t *packet) {
 #endif
 }
 
-bool open(uint8_t *packet) {
+bool open(uint8_t *packet, const uint8_t key[KEY_SIZE]) {
 #if OMNI_RADIO_CRYPTO != OMNI_CRYPTO_CHACHAPOLY
     return !(packet[FLAGS_OFFSET] & proto::FLAG_ENCRYPTED);   // benchmark: plaintext only
 #else

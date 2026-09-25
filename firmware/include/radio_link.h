@@ -1,14 +1,18 @@
 // ============================================================
 // Radio link — ESP-NOW transport between the two boards
 // ============================================================
-// Both boards send MSG_HEARTBEAT every 100 ms and answer each other's
-// heartbeats with MSG_HEARTBEAT_ACK, which gives a round-trip time
-// (RTT) measurement. Input packets (keyboard/mouse) queued with
-// sendToPeer() are delivered to the peer's input handler.
+// Until a session is up, each board sends MSG_SESSION_HELLO every
+// 100 ms to agree on a fresh session key (see session.h). Then both
+// send MSG_HEARTBEAT every 100 ms and answer each other's heartbeats
+// with MSG_HEARTBEAT_ACK, which gives a round-trip time (RTT)
+// measurement. Input packets (keyboard/mouse) queued with sendToPeer()
+// are delivered to the peer's input handler.
 //
-// Temporary until pairing (Phase 5): the first board heard sending a
-// valid heartbeat becomes the peer, until reboot. There is no
-// encryption or replay protection yet.
+// Every radio packet is sealed (secure_packet.h); within a session, a
+// packet with an old sequence number is dropped as a replay.
+//
+// Temporary until pairing (Phase 5): the first board heard sending an
+// authentic HELLO becomes the peer, until reboot.
 // ============================================================
 
 #pragma once
