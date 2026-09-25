@@ -59,7 +59,7 @@ Wireless input is a sensitive channel. The threat model and mitigations are docu
 ## Roadmap
 
 - [x] **Phase 0** — Development environment + hello-world firmware on both boards
-- [ ] **Phase 1** — USB HID composite device firmware
+- [x] **Phase 1** — USB HID composite device firmware
 - [ ] **Phase 2** — ESP-NOW wireless link with encryption
 - [ ] **Phase 3** — Windows host daemon + virtual resistance UX
 - [ ] **Phase 4** — macOS host daemon + monitor layout negotiation
