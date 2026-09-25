@@ -17,7 +17,7 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 
 **Threat**: An attacker within radio range (~30–100 m) captures encrypted packets and attempts to read keystroke content.
 
-**Mitigation**: AES-128-CTR encryption on all payloads. Key established via ECDH during pairing (never transmitted). Without the key, captured packets are indistinguishable from random data.
+**Mitigation**: AES-128-GCM encryption on all radio packets, with a fresh random nonce per packet. Key established via ECDH during pairing (never transmitted; until pairing exists, a locally generated development key that is never committed). Without the key, captured payloads are indistinguishable from random data.
 
 **Residual risk**: If AES-128 is broken (no known practical attack exists as of 2025), or if the pairing exchange was observed AND the ECDH implementation has a flaw. **Risk level: very low.**
 
@@ -25,9 +25,9 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 
 **Threat**: Attacker records encrypted packets and retransmits them later to cause unintended keystrokes or mouse movements on the victim's computer.
 
-**Mitigation**: Monotonically increasing 32-bit sequence numbers. Receiver drops any packet with seq ≤ last seen. Re-key on sequence wrap.
+**Mitigation**: Monotonically increasing 32-bit sequence numbers. Receiver drops any authentic packet with seq ≤ last seen. The sequence number is in the header, which the GCM tag authenticates, so it cannot be changed without detection. Re-key on sequence wrap.
 
-**Residual risk**: None, assuming correct implementation. Sequence numbers are in the plaintext header, so the receiver can reject replays before attempting decryption. **Risk level: none (if implemented correctly).**
+**Residual risk (current firmware)**: After 3 seconds without an authentic packet, the receiver accepts the peer's sequence number afresh so a rebooted peer can reconnect. An attacker who records traffic and then jams the channel for 3 seconds could replay the recording during that window. Planned fix: per-connection session keys, under which old recordings fail authentication (see `security.md`). **Risk level: medium until session keys ship, then none (if implemented correctly).**
 
 ### T3 — Man-in-the-middle during pairing
 
@@ -41,7 +41,7 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 
 **Threat**: Attacker builds or reprograms an ESP32-S3 to impersonate a legitimate Omni-KVM device and pairs with the victim's device.
 
-**Mitigation**: Pairing requires physical button press on the legitimate device. MAC address filtering after pairing. The attacker's rogue device cannot trigger the button press on the victim's real device.
+**Mitigation**: Pairing requires physical button press on the legitimate device. MAC address filtering after pairing; since MAC addresses can be spoofed, every packet must also authenticate with the shared key (GCM tag), and a board only accepts a peer whose packets authenticate. The attacker's rogue device cannot trigger the button press on the victim's real device.
 
 **Residual risk**: If the attacker steals the victim's physical device, replaces it with a rogue one, and the victim doesn't notice. This is a physical security issue, not a wireless protocol issue. **Risk level: very low for the target user profile.**
 
@@ -108,12 +108,20 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 
 **Residual risk**: Moderate if flash encryption is disabled; very low if enabled. **Risk level: low with recommended configuration.**
 
+### T11 — Packet tampering (bit-flipping)
+
+**Threat**: An attacker within radio range captures a packet, flips bits in the ciphertext, and retransmits it, hoping to change a keystroke or mouse movement without knowing the key. Against a cipher mode with no integrity check (such as plain AES-CTR, which the first version of this design used), this works: the protocol layout is public, so the attacker knows which bytes hold the keycode.
+
+**Mitigation**: AES-GCM authentication tag over the ciphertext and the header. Any modified bit makes verification fail and the packet is dropped. Verified on hardware: packets sealed with a different key are rejected 100% of the time.
+
+**Residual risk**: None beyond breaking AES-GCM itself, provided nonces are never reused (they are random per packet). **Risk level: very low.**
+
 ## Summary matrix
 
 | Threat | Mitigated? | Residual Risk |
 |---|---|---|
 | T1 Eavesdropping | Yes | Very low |
-| T2 Replay | Yes | None |
+| T2 Replay | Partly (gap until session keys) | Medium, then none |
 | T3 MITM pairing | Mostly | Low |
 | T4 Rogue device | Yes | Very low |
 | T5 Jamming | Graceful degradation | Low |
@@ -122,3 +130,4 @@ Omni-KVM is a **personal-use hardware KVM** for sharing keyboard and mouse input
 | T8 Supply chain | Yes | Very low |
 | T9 Hardware backdoor | Accepted | Very low |
 | T10 Lost device | Yes (with flash encryption) | Low |
+| T11 Packet tampering | Yes | Very low |

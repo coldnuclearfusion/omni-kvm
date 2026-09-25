@@ -10,7 +10,7 @@ Omni-KVM transports raw keyboard and mouse input over a wireless radio link. Key
 
 1. **No internet exposure.** The ESP32-S3 firmware never connects to Wi-Fi access points or the internet. All radio activity is limited to ESP-NOW peer-to-peer communication with a single paired device. This eliminates an entire class of remote attacks.
 
-2. **Encrypt by default.** After initial pairing, all payload data is AES-128-CTR encrypted. There is no "unencrypted mode" in production firmware. Debug builds may disable encryption for development, but they are clearly marked and refuse to pair with production devices.
+2. **Encrypt by default.** Every radio packet is sealed with AES-128-GCM (encrypted and authenticated). There is no "unencrypted mode": the firmware drops any radio packet that is not sealed with its key. Until pairing exists, development builds use a locally generated key that is never committed.
 
 3. **Minimal attack surface on the firmware.** The firmware does not parse complex formats, run a web server, accept OTA updates from the network, or expose any IP-based services. Its radio interface accepts only packets from a single known MAC address, with a known magic byte, in a fixed-size format.
 
@@ -78,14 +78,19 @@ Implementation note: ESP32-S3 has hardware acceleration for SHA-256. Curve25519 
 
 ## Encryption
 
-### Algorithm: AES-128-CTR
+### Algorithm: AES-128-GCM
 
-All radio payloads (bytes 8–63 of each packet) are encrypted after pairing is complete. See `protocol.md` for the packet structure.
+Every radio packet is sealed with AES-128-GCM. See `protocol.md` ("Encryption") for the exact byte layout.
 
-- **Mode**: CTR (Counter Mode). A stream cipher mode that XORs plaintext with a keystream generated from the key and a nonce. No padding needed for our fixed-size payloads.
-- **Key**: 128-bit, derived during pairing, stored in device flash.
-- **Nonce construction**: `seq (4 bytes) || device_pair_id (12 bytes)` = 16-byte IV. Since `seq` is monotonically increasing and never reused within a session, nonce uniqueness is guaranteed.
-- **Hardware acceleration**: ESP32-S3 includes an AES hardware accelerator, so encryption adds negligible latency (< 0.01 ms per packet).
+- **Mode**: GCM, an authenticated encryption mode. It provides **confidentiality** (the payload is unreadable without the key) and **integrity** (a 16-byte tag covers the ciphertext and the plaintext header, so any altered bit is detected and the packet dropped).
+- **Key**: 128-bit. Development builds use a key generated locally by `tools/make_dev_key.py` (git-ignored); pairing will derive it on the devices (Phase 5).
+- **Nonce**: 12 random bytes from the hardware RNG, fresh for every packet and sent alongside it. Random nonces stay unique across reboots and between the two boards, which share one key.
+- **Implementation**: mbedTLS (bundled with ESP-IDF), using the ESP32-S3 AES accelerator. We use the library's GCM functions and do not implement any cryptographic primitive ourselves.
+- **Cost**: measured ≈ 0.21 ms to seal and ≈ 0.21 ms to open a packet, far above the < 0.01 ms we first assumed. See `protocol.md` for the numbers and a possible faster alternative.
+
+**Why the design changed from AES-128-CTR.** The first version of this document specified AES-128-CTR with a nonce built from the sequence number. CTR alone has no integrity check, so an attacker could flip ciphertext bits to change keystrokes without knowing the key, and the sequence number restarts after a reboot, which would reuse nonces under the same key. `protocol.md` explains both flaws in detail.
+
+**Verified on hardware (Phase 2)**: two boards with the same key link up with zero authentication failures; when one board is flashed with a different key, every packet from it fails authentication and the boards never accept each other as peers.
 
 ### What is encrypted
 
@@ -109,9 +114,13 @@ This is explicitly documented in `threat-model.md` as an accepted residual risk.
 
 Each packet carries a 32-bit sequence number in the plaintext header. The receiver maintains the highest sequence number seen from each peer and drops any packet with a sequence number less than or equal to the stored value.
 
-This prevents an attacker from recording encrypted packets and replaying them later. Even though the attacker cannot read the contents, replaying old mouse movements or keystrokes could cause unintended actions.
+This prevents an attacker from recording encrypted packets and replaying them later. Even though the attacker cannot read the contents, replaying old mouse movements or keystrokes could cause unintended actions. The sequence number is in the header, which the GCM tag authenticates, so it cannot be altered to make an old packet look new.
 
-The sequence counter wraps at 2^32 (~4 billion). At 1000 packets/second, this takes ~50 days of continuous use before wrapping. On wrap, both sides perform a brief re-key handshake to reset the counter and derive a fresh session key, preventing nonce reuse.
+**Known gap (current firmware).** When a board reboots, its sequence number starts again at 1. To let it reconnect, the receiver accepts the peer's sequence number afresh once the link has been down for 3 seconds. An attacker who records traffic, then jams the channel for 3 seconds, could replay the recording during that window.
+
+**Planned fix: session keys.** On every link-up, each board contributes a fresh random value, and both derive a session key from the long-term key and the two values. Packets from an earlier session then fail authentication, so the sequence number can safely restart for each session.
+
+The sequence counter wraps at 2^32 (~4 billion). At 1000 packets/second, this takes ~50 days of continuous use before wrapping. On wrap, both sides start a new session.
 
 ## Fail-safe behavior
 
