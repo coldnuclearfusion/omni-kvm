@@ -28,6 +28,7 @@ enum MsgType : uint8_t {
     MSG_KEY_DOWN         = 0x03,
     MSG_KEY_UP           = 0x04,
     MSG_MODIFIER_SYNC    = 0x05,
+    MSG_INPUT_ACK        = 0x06,   // receiver -> sender: "input packet <seq> processed"
     MSG_HANDOFF          = 0x10,
     MSG_HANDOFF_ACK      = 0x11,
     MSG_HEARTBEAT        = 0x20,
@@ -109,9 +110,9 @@ static_assert(sizeof(SessionHello) <= SEALED_DATA_SIZE, "HELLO must fit in a sea
 // MSG_DAEMON_CMD / MSG_DAEMON_STATUS: between a host and its own board
 // over USB CDC only, never over the radio (so not limited to 28 bytes).
 constexpr uint8_t CMD_REQUEST_LINK_STATS = 0x04;
-constexpr uint8_t CMD_SET_TX_WINDOW = 0x06;     // development: data[0] = window (0 = no limit)
+constexpr uint8_t CMD_SET_PHY_RATE = 0x07;      // development: data[0] = wifi_phy_rate_t
 constexpr uint8_t STATUS_LINK_STATS = 0x03;
-constexpr uint8_t LINK_STATS_LAYOUT = 2;        // bump whenever LinkStats changes
+constexpr uint8_t LINK_STATS_LAYOUT = 3;        // bump whenever LinkStats changes
 
 // Counters since boot. "host_*" are input packets from this board's host;
 // "radio_*" are input packets over the radio.
@@ -119,23 +120,31 @@ struct __attribute__((packed)) LinkStats {
     uint8_t status_id;              // STATUS_LINK_STATS
     uint8_t layout;                 // LINK_STATS_LAYOUT, so readers can detect a mismatch
     uint8_t link_up;
+    uint8_t phy_rate;               // current radio TX rate (wifi_phy_rate_t)
     uint32_t session;               // session generation (0 = none yet)
     uint32_t host_received;
     uint32_t host_dropped;          // not queued for the radio: link down, or queue full
-    uint32_t radio_sent;            // handed to ESP-NOW
-    uint32_t radio_send_retries;    // ESP-NOW was busy; sent again later
+    uint32_t radio_sent;            // input packets handed to ESP-NOW, retransmissions included
+    uint32_t radio_retransmits;     // input packets sent again after a failed delivery
+    uint32_t radio_gave_up;         // input packets still undelivered after every attempt
     uint32_t radio_received;        // authentic input packets from the peer
     uint32_t radio_rx_overflow;     // any packet dropped because the receive queue was full
     uint32_t auth_failures;
     uint32_t replays_dropped;
-    uint32_t frames_sent;           // every radio frame accepted by ESP-NOW (heartbeats too)
-    uint32_t frames_acked;          // ...confirmed delivered at the MAC layer
+    uint32_t frames_acked;          // radio frames (heartbeats too) delivered at the MAC layer
     uint32_t frames_failed;         // ...not acknowledged, even after MAC retries
     uint16_t hid_stalls;            // keyboard output had to wait for USB (saturates)
     uint16_t hid_mouse_dropped;     // mouse reports dropped, USB not ready (saturates)
 };
 static_assert(sizeof(LinkStats) <= PAYLOAD_SIZE, "LinkStats must fit in a packet");
-static_assert(sizeof(LinkStats) == 55, "Layout changed: bump LINK_STATS_LAYOUT and update tools/hid_test.py");
+static_assert(sizeof(LinkStats) == 56, "Layout changed: bump LINK_STATS_LAYOUT and update the readers "
+                                       "(tools/hid_test.py, daemon/src/protocol.rs)");
+
+// MSG_INPUT_ACK: sent by the receiving board after it has processed an
+// input packet that carried FLAG_ACK_REQUESTED.
+struct __attribute__((packed)) InputAck {
+    uint32_t seq;           // the acknowledged packet's header seq
+};
 
 // Used by both MSG_HEARTBEAT and MSG_HEARTBEAT_ACK. The ACK echoes the
 // heartbeat's timestamp so the original sender can compute the RTT.

@@ -70,14 +70,16 @@ fn report_until_error(board: &mut Board) {
     loop {
         match board.request_stats(Duration::from_secs(1)) {
             Ok(s) => println!(
-                "link {} | session {} | input from this PC {} (dropped {}) | from peer {} | \
-                 frames {} acked {} failed {} | auth failures {} | replays {}",
+                "link {} @ {} | session {} | input from this PC {} (dropped {}, resent {}, gave up {}) | \
+                 from peer {} | frames acked {} failed {} | auth failures {} | replays {}",
                 if s.link_up { "UP" } else { "DOWN" },
+                protocol::phy_rate_name(s.phy_rate),
                 s.session,
                 s.host_received,
                 s.host_dropped,
+                s.radio_retransmits,
+                s.radio_gave_up,
                 s.radio_received,
-                s.frames_sent,
                 s.frames_acked,
                 s.frames_failed,
                 s.auth_failures,

@@ -11,6 +11,7 @@ Usage (needs pyserial; PlatformIO's Python already has it):
     python tools/hid_test.py click right
     python tools/hid_test.py scroll -3
     python tools/hid_test.py stats          # the board's link counters
+    python tools/hid_test.py rate 6M        # development: radio TX rate
 
 Typed text goes to whichever window has focus. On Windows, add
 --wait-for-notepad to hold the packets until Notepad is in front.
@@ -35,15 +36,20 @@ MSG_KEY_UP = 0x04
 MSG_DAEMON_CMD = 0x40
 MSG_DAEMON_STATUS = 0x41
 CMD_REQUEST_LINK_STATS = 0x04
-CMD_SET_TX_WINDOW = 0x06
+CMD_SET_PHY_RATE = 0x07
 STATUS_LINK_STATS = 0x03
-LINK_STATS_FIELDS = ("link_up", "session", "host_received", "host_dropped",
-                     "radio_sent", "radio_send_retries", "radio_received", "radio_rx_overflow",
-                     "auth_failures", "replays_dropped", "frames_sent", "frames_acked",
+LINK_STATS_FIELDS = ("link_up", "phy_rate", "session", "host_received", "host_dropped",
+                     "radio_sent", "radio_retransmits", "radio_gave_up", "radio_received",
+                     "radio_rx_overflow", "auth_failures", "replays_dropped", "frames_acked",
                      "frames_failed", "hid_stalls", "hid_mouse_dropped")
-LINK_STATS_LAYOUT = 2            # proto::LINK_STATS_LAYOUT
-LINK_STATS_FORMAT = "<BI11IHH"   # after status_id and layout; matches proto::LinkStats
-assert struct.calcsize(LINK_STATS_FORMAT) == 55 - 2, "out of sync with proto::LinkStats"
+LINK_STATS_LAYOUT = 3            # proto::LINK_STATS_LAYOUT
+LINK_STATS_FORMAT = "<BB12IHH"   # after status_id and layout; matches proto::LinkStats
+assert struct.calcsize(LINK_STATS_FORMAT) == 56 - 2, "out of sync with proto::LinkStats"
+
+# ESP-NOW PHY rates (wifi_phy_rate_t) the firmware accepts
+PHY_RATES = {"1M": 0x00, "2M": 0x01, "5.5M": 0x02, "11M": 0x03, "6M": 0x0B, "9M": 0x0F,
+             "12M": 0x0A, "18M": 0x0E, "24M": 0x09, "36M": 0x0D, "48M": 0x08, "54M": 0x0C}
+PHY_RATE_NAMES = {v: k for k, v in PHY_RATES.items()}
 
 MOD_LEFT_SHIFT = 0x02
 MOUSE_BUTTONS = {"left": 0x01, "right": 0x02, "middle": 0x04}
@@ -104,9 +110,9 @@ class Link:
                     return dict(zip(LINK_STATS_FIELDS, values))
         sys.exit("No link stats reply from the board.")
 
-    def set_tx_window(self, window):
-        """Development: most input frames in flight on the board (0 = no limit)."""
-        self.send(MSG_DAEMON_CMD, bytes([CMD_SET_TX_WINDOW, window]))
+    def set_phy_rate(self, name):
+        """Development: set the board's radio TX rate, e.g. "24M"."""
+        self.send(MSG_DAEMON_CMD, bytes([CMD_SET_PHY_RATE, PHY_RATES[name]]))
 
     def close(self):
         self.serial.flush()
@@ -163,8 +169,8 @@ def main():
                                          choices=MOUSE_BUTTONS)
     sub.add_parser("scroll").add_argument("amount", type=int, help="positive = up")
     sub.add_parser("stats")
-    sub.add_parser("window", help="development: set the board's radio TX window").add_argument(
-        "frames", type=int, help="most input frames in flight, 0 = no limit")
+    sub.add_parser("rate", help="development: set the board's radio TX rate").add_argument(
+        "name", choices=PHY_RATES)
     args = parser.parse_args()
 
     link = Link(args.port or find_board_port())
@@ -183,9 +189,11 @@ def main():
         link.send(MSG_MOUSE_SCROLL, struct.pack("<hh", args.amount, 0))
     elif args.command == "stats":
         for name, value in link.request_stats().items():
+            if name == "phy_rate":
+                value = PHY_RATE_NAMES.get(value, hex(value))
             print(f"{name:20s} {value}")
-    elif args.command == "window":
-        link.set_tx_window(args.frames)
+    elif args.command == "rate":
+        link.set_phy_rate(args.name)
 
     link.close()
     if args.command in ("type", "move", "click", "scroll"):

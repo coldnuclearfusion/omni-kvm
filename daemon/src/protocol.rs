@@ -23,7 +23,7 @@ pub mod msg {
 
 pub const CMD_REQUEST_LINK_STATS: u8 = 0x04;
 pub const STATUS_LINK_STATS: u8 = 0x03;
-pub const LINK_STATS_LAYOUT: u8 = 2;
+pub const LINK_STATS_LAYOUT: u8 = 3;
 
 /// Builds a 64-byte packet: header, then `payload`, zero-padded.
 pub fn packet(msg_type: u8, seq: u32, payload: &[u8]) -> [u8; PACKET_SIZE] {
@@ -42,16 +42,18 @@ pub fn packet(msg_type: u8, seq: u32, payload: &[u8]) -> [u8; PACKET_SIZE] {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkStats {
     pub link_up: bool,
+    /// Radio TX rate (ESP-IDF `wifi_phy_rate_t`), see [`phy_rate_name`].
+    pub phy_rate: u8,
     pub session: u32,
     pub host_received: u32,
     pub host_dropped: u32,
     pub radio_sent: u32,
-    pub radio_send_retries: u32,
+    pub radio_retransmits: u32,
+    pub radio_gave_up: u32,
     pub radio_received: u32,
     pub radio_rx_overflow: u32,
     pub auth_failures: u32,
     pub replays_dropped: u32,
-    pub frames_sent: u32,
     pub frames_acked: u32,
     pub frames_failed: u32,
     pub hid_stalls: u16,
@@ -90,26 +92,46 @@ impl LinkStats {
         if p[1] != LINK_STATS_LAYOUT {
             return Err(ParseError::WrongLayout(p[1]));
         }
-        // Little-endian fields, in proto::LinkStats order after `link_up`.
+        // Little-endian fields, in proto::LinkStats order.
         let u32_at = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
         let u16_at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
         Ok(LinkStats {
             link_up: p[2] != 0,
-            session: u32_at(3),
-            host_received: u32_at(7),
-            host_dropped: u32_at(11),
-            radio_sent: u32_at(15),
-            radio_send_retries: u32_at(19),
-            radio_received: u32_at(23),
-            radio_rx_overflow: u32_at(27),
-            auth_failures: u32_at(31),
-            replays_dropped: u32_at(35),
-            frames_sent: u32_at(39),
-            frames_acked: u32_at(43),
-            frames_failed: u32_at(47),
-            hid_stalls: u16_at(51),
-            hid_mouse_dropped: u16_at(53),
+            phy_rate: p[3],
+            session: u32_at(4),
+            host_received: u32_at(8),
+            host_dropped: u32_at(12),
+            radio_sent: u32_at(16),
+            radio_retransmits: u32_at(20),
+            radio_gave_up: u32_at(24),
+            radio_received: u32_at(28),
+            radio_rx_overflow: u32_at(32),
+            auth_failures: u32_at(36),
+            replays_dropped: u32_at(40),
+            frames_acked: u32_at(44),
+            frames_failed: u32_at(48),
+            hid_stalls: u16_at(52),
+            hid_mouse_dropped: u16_at(54),
         })
+    }
+}
+
+/// Human-readable name of an ESP-NOW PHY rate code.
+pub fn phy_rate_name(code: u8) -> &'static str {
+    match code {
+        0x00 => "1M",
+        0x01 => "2M",
+        0x02 => "5.5M",
+        0x03 => "11M",
+        0x0B => "6M",
+        0x0F => "9M",
+        0x0A => "12M",
+        0x0E => "18M",
+        0x09 => "24M",
+        0x0D => "36M",
+        0x08 => "48M",
+        0x0C => "54M",
+        _ => "?",
     }
 }
 
@@ -127,21 +149,23 @@ mod tests {
 
     #[test]
     fn parses_link_stats() {
-        let mut payload = vec![STATUS_LINK_STATS, LINK_STATS_LAYOUT, 1];
+        let mut payload = vec![STATUS_LINK_STATS, LINK_STATS_LAYOUT, 1, 0x09];
         for v in 1u32..=12 {
             payload.extend_from_slice(&v.to_le_bytes());
         }
         payload.extend_from_slice(&13u16.to_le_bytes());
         payload.extend_from_slice(&14u16.to_le_bytes());
+        assert_eq!(payload.len(), 56, "LinkStats is 56 bytes");
         let s = LinkStats::parse(&packet(msg::DAEMON_STATUS, 0, &payload)).unwrap();
         assert!(s.link_up);
-        assert_eq!((s.session, s.host_received, s.frames_failed), (1, 2, 12));
+        assert_eq!(phy_rate_name(s.phy_rate), "24M");
+        assert_eq!((s.session, s.host_received, s.radio_retransmits, s.frames_failed), (1, 2, 5, 12));
         assert_eq!((s.hid_stalls, s.hid_mouse_dropped), (13, 14));
     }
 
     #[test]
     fn rejects_other_layouts() {
-        let p = packet(msg::DAEMON_STATUS, 0, &[STATUS_LINK_STATS, 1, 1]);
-        assert_eq!(LinkStats::parse(&p), Err(ParseError::WrongLayout(1)));
+        let p = packet(msg::DAEMON_STATUS, 0, &[STATUS_LINK_STATS, 2, 1]);
+        assert_eq!(LinkStats::parse(&p), Err(ParseError::WrongLayout(2)));
     }
 }

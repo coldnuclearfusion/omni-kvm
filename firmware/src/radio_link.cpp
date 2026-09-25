@@ -22,14 +22,15 @@ static_assert(sizeof(DEV_RADIO_KEY) == secure_packet::KEY_SIZE,
               "Old 128-bit key. Run: python tools/make_dev_key.py --force (then flash both boards)");
 
 // Radio settings, overridable with build flags for experiments. Chosen
-// from the Phase 2 jitter experiment (shared/protocol.md, "Radio
-// settings"): 24 Mbps halved the median RTT versus ESP-NOW's default
-// 1 Mbps and cut samples over 5 ms from ~19% to ~2%.
+// from the Phase 2/3 experiments (shared/protocol.md, "Radio settings"):
+// 24 Mbps gave the lowest latency on an open desk, but next to a laptop
+// it lost 12-99% of frames. At the worst spot, 18 Mbps and below lost
+// none; 12 Mbps keeps more signal margin than 18 for ~0.3 ms per packet.
 #ifndef OMNI_RADIO_CHANNEL
 #define OMNI_RADIO_CHANNEL 6
 #endif
 #ifndef OMNI_RADIO_PHY_RATE
-#define OMNI_RADIO_PHY_RATE WIFI_PHY_RATE_24M
+#define OMNI_RADIO_PHY_RATE WIFI_PHY_RATE_12M
 #endif
 // OMNI_LOG_RTT_SAMPLES: 1 prints every RTT sample ("rtt <us>").
 
@@ -43,14 +44,36 @@ static const size_t RX_QUEUE_LEN = 32;
 static const size_t TX_QUEUE_LEN = 128;
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+static const uint8_t MAX_INPUT_ATTEMPTS = 6;         // first try + 5 retransmissions
+static const uint32_t INPUT_ACK_TIMEOUT_MS = 25;     // a round trip normally takes ~2 ms
+
 static PacketHandler inputHandler = nullptr;
 
-// Input packets waiting to go out. ESP-NOW only buffers a few packets
-// itself and refuses more (ESP_ERR_ESPNOW_NO_MEM) when sent in a burst,
-// so we keep them here and retry on the next loop pass.
-static uint8_t txQueue[TX_QUEUE_LEN][proto::PACKET_SIZE];
+// Input packets waiting to go out, in order.
+struct Outgoing {
+    uint8_t packet[proto::PACKET_SIZE];
+    bool needsAck;          // key event or mouse button change: must arrive
+};
+static Outgoing txQueue[TX_QUEUE_LEN];
 static size_t txHead = 0;
 static size_t txCount = 0;
+
+// The input packet waiting for the peer's MSG_INPUT_ACK. Only one such
+// packet is outstanding at a time, and nothing queued after it is sent
+// until it is acknowledged, so the peer never sees "key up" before a
+// late "key down". Every attempt goes out with a new sequence number;
+// an acknowledgement of any of them counts.
+struct AwaitingAck {
+    bool active = false;
+    uint8_t packet[proto::PACKET_SIZE];     // plaintext, for retransmission
+    uint8_t attempts = 0;
+    uint32_t seqs[MAX_INPUT_ATTEMPTS];
+    uint32_t sentMs = 0;
+};
+static AwaitingAck awaiting;
+static uint8_t lastQueuedButtons = 0;       // mouse buttons in the last queued MOUSE_MOVE
+
+static uint8_t phyRate = OMNI_RADIO_PHY_RATE;
 
 // ESP-NOW calls onReceive() from the Wi-Fi task, which runs at the same
 // time as loop(). onReceive() only copies the packet into this queue;
@@ -78,7 +101,6 @@ struct Stats {
     uint32_t hellosReceived = 0;
     uint32_t inputSent = 0;
     uint32_t inputReceived = 0;
-    uint32_t inputRetries = 0;
     uint32_t rttCount = 0;
     uint32_t rttSumUs = 0;
     uint32_t rttMinUs = UINT32_MAX;
@@ -96,23 +118,19 @@ static Stats stats;
 // shared with the Wi-Fi task: each is written by only one side.
 static Totals total;
 static std::atomic<uint32_t> rxOverflow{0};     // written in onReceive (Wi-Fi task)
-static std::atomic<uint32_t> framesSent{0};     // written in transmit() (loop)
 static std::atomic<uint32_t> framesAcked{0};    // written in onSent (Wi-Fi task)
 static std::atomic<uint32_t> framesFailed{0};   // written in onSent (Wi-Fi task)
-static uint8_t txWindow = 0;                    // 0 = no limit
 
-// ESP-NOW reports the fate of every frame: delivered (acknowledged by the
-// receiver at the MAC layer) or failed after its automatic retries.
+// ESP-NOW reports each frame as delivered (acknowledged by the peer's
+// radio) or failed after its own retries. That only means the peer's
+// radio received it, not that the peer processed it, so input delivery
+// relies on MSG_INPUT_ACK instead; these counts are diagnostics.
 static void onSent(const uint8_t *mac, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
         framesAcked++;
     } else {
         framesFailed++;
     }
-}
-
-static uint32_t framesInFlight() {
-    return framesSent - framesAcked - framesFailed;
 }
 
 static String macToString(const uint8_t *mac) {
@@ -154,10 +172,11 @@ static const uint8_t *keyFor(uint8_t msgType) {
     return msgType == proto::MSG_SESSION_HELLO ? session::longTermKey() : session::sessionKey();
 }
 
-// Stamps our radio sequence number into a copy of the packet, seals it,
+// Stamps our next sequence number into a copy of the packet, seals it,
 // and hands it to ESP-NOW. The caller's packet stays plaintext so it can
-// be retried.
-static esp_err_t transmit(const uint8_t *mac, const uint8_t *packet) {
+// be sent again; every send gets a fresh sequence number and nonce.
+// On success, *usedSeq (if given) receives the sequence number used.
+static esp_err_t transmit(const uint8_t *mac, const uint8_t *packet, uint32_t *usedSeq = nullptr) {
     uint8_t sealed[proto::PACKET_SIZE];
     memcpy(sealed, packet, sizeof(sealed));
     uint32_t seq = txSeq + 1;
@@ -173,7 +192,7 @@ static esp_err_t transmit(const uint8_t *mac, const uint8_t *packet) {
     esp_err_t result = esp_now_send(mac, sealed, sizeof(sealed));
     if (result == ESP_OK) {
         txSeq = seq;
-        framesSent++;
+        if (usedSeq) *usedSeq = seq;
     }
     return result;
 }
@@ -186,23 +205,63 @@ static void send(const uint8_t *mac, uint8_t msgType, const void *payload, size_
     transmit(mac, packet);
 }
 
-// Sends queued input packets until ESP-NOW's own buffer is full.
-static void flushTxQueue() {
-    while (txCount > 0 && session::isUp()) {
-        if (txWindow != 0 && framesInFlight() >= txWindow) return;   // wait for delivery reports
-        esp_err_t result = transmit(peerMac, txQueue[txHead]);
-        if (result == ESP_ERR_ESPNOW_NO_MEM) {
-            stats.inputRetries++;
-            total.inputRetries++;
-            return;                 // ESP-NOW is busy; try again next pass
+// The peer processed one of our input packets.
+static void onInputAck(uint32_t seq) {
+    if (!awaiting.active) return;
+    for (uint8_t i = 0; i < awaiting.attempts; i++) {
+        if (awaiting.seqs[i] == seq) {
+            awaiting.active = false;
+            return;
         }
-        if (result == ESP_OK) {
-            stats.inputSent++;
-            total.inputSent++;
-        }
-        txHead = (txHead + 1) % TX_QUEUE_LEN;
-        txCount--;
     }
+}
+
+// Resends the packet awaiting acknowledgement if its time is up, or gives
+// up after MAX_INPUT_ATTEMPTS. Returns true while it is still outstanding.
+static bool serviceAwaitingAck() {
+    if (!awaiting.active) return false;
+    if (millis() - awaiting.sentMs < INPUT_ACK_TIMEOUT_MS) return true;
+    if (awaiting.attempts >= MAX_INPUT_ATTEMPTS || !session::isUp()) {
+        awaiting.active = false;
+        total.inputGaveUp++;
+        return false;
+    }
+    uint32_t seq;
+    esp_err_t result = transmit(peerMac, awaiting.packet, &seq);
+    if (result == ESP_OK) {
+        awaiting.seqs[awaiting.attempts++] = seq;
+        awaiting.sentMs = millis();
+        stats.inputSent++;
+        total.inputSent++;
+        total.inputRetransmits++;
+    }
+    return true;    // on ESP_ERR_ESPNOW_NO_MEM, try again next pass
+}
+
+// Sends the next queued input packet, unless an earlier one is still
+// waiting to be acknowledged.
+static void flushTxQueue() {
+    if (serviceAwaitingAck()) return;
+    if (txCount == 0 || !session::isUp()) return;
+
+    Outgoing &next = txQueue[txHead];
+    if (next.needsAck) next.packet[offsetof(proto::Header, flags)] |= proto::FLAG_ACK_REQUESTED;
+    uint32_t seq;
+    esp_err_t result = transmit(peerMac, next.packet, &seq);
+    if (result == ESP_ERR_ESPNOW_NO_MEM) return;    // ESP-NOW is busy; try again next pass
+    if (result == ESP_OK) {
+        stats.inputSent++;
+        total.inputSent++;
+        if (next.needsAck) {
+            awaiting.active = true;
+            memcpy(awaiting.packet, next.packet, sizeof(awaiting.packet));
+            awaiting.attempts = 1;
+            awaiting.seqs[0] = seq;
+            awaiting.sentMs = millis();
+        }
+    }
+    txHead = (txHead + 1) % TX_QUEUE_LEN;
+    txCount--;
 }
 
 static void handleHello(const Received &r) {
@@ -280,6 +339,19 @@ static void handle(Received &r) {
         stats.inputReceived++;
         total.inputReceived++;
         if (inputHandler) inputHandler(r.data);
+        // Acknowledge after processing, so "acknowledged" means "applied".
+        // A retransmitted copy is applied again, which is harmless: input
+        // messages carry state ("key A is down"), not toggles.
+        if (header.flags & proto::FLAG_ACK_REQUESTED) {
+            proto::InputAck ack = {header.seq};
+            send(peerMac, proto::MSG_INPUT_ACK, &ack, sizeof(ack));
+        }
+        return;
+    }
+    if (header.msg_type == proto::MSG_INPUT_ACK) {
+        proto::InputAck ack;
+        memcpy(&ack, r.data + proto::HEADER_SIZE, sizeof(ack));
+        onInputAck(ack.seq);
         return;
     }
 
@@ -322,9 +394,9 @@ static void printStats() {
                       stats.heartbeatsSent, stats.heartbeatsReceived,
                       stats.rttMinUs, stats.rttSumUs / stats.rttCount, stats.rttMaxUs);
     }
-    if (stats.inputSent || stats.inputReceived || stats.inputRetries) {
-        Serial.printf("[radio] input sent %u (retries %u), received %u\n",
-                      stats.inputSent, stats.inputRetries, stats.inputReceived);
+    if (stats.inputSent || stats.inputReceived) {
+        Serial.printf("[radio] input sent %u, received %u | since boot: retransmitted %u, gave up %u\n",
+                      stats.inputSent, stats.inputReceived, total.inputRetransmits, total.inputGaveUp);
     }
     Serial.printf("[radio] crypto %s: seal avg %u us, open avg %u us | auth failures %u, replays dropped %u\n",
                   secure_packet::modeName(),
@@ -403,7 +475,7 @@ static void testReplay() {
 
     if (havePrevious && !replayedPrevious && t > 2000) {
         replayedPrevious = true;
-        if (esp_now_send(peerMac, previous, sizeof(previous)) == ESP_OK) framesSent++;
+        esp_now_send(peerMac, previous, sizeof(previous));
         Serial.println("[test] replayed a packet recorded in the PREVIOUS session");
     }
     if (!recorded && t > 5000) {
@@ -414,7 +486,7 @@ static void testReplay() {
         memcpy(packet, &header, sizeof(header));
         memcpy(packet + proto::HEADER_SIZE, &hb, sizeof(hb));
         secure_packet::seal(packet, session::sessionKey());
-        if (esp_now_send(peerMac, packet, sizeof(packet)) == ESP_OK) framesSent++;
+        esp_now_send(peerMac, packet, sizeof(packet));
         memcpy(recording, packet, sizeof(recording));
         recordingMagic = RECORDING_VALID;
         recorded = true;
@@ -422,7 +494,7 @@ static void testReplay() {
     }
     if (recorded && !replayedCurrent && t > 8000) {
         replayedCurrent = true;
-        if (esp_now_send(peerMac, recording, sizeof(recording)) == ESP_OK) framesSent++;
+        esp_now_send(peerMac, recording, sizeof(recording));
         Serial.println("[test] replayed a packet recorded in THIS session");
     }
     if (!havePrevious && replayedCurrent && t > 10000) {
@@ -484,9 +556,34 @@ bool isLinkUp() {
     return session::isUp() && millis() - lastHeardMs < LINK_TIMEOUT_MS;
 }
 
+// Must this input packet be acknowledged (and resent until it is)? Key
+// events and modifier syncs are: a lost one means a missing or stuck
+// key. Mouse movement is not: a late delta makes the pointer jump, and
+// the next one moves it anyway. But a movement that changes the buttons
+// is, or a click or drag could get stuck. Repeats are harmless, because
+// the peer applies them as state ("key A is down"), not as toggles.
+static bool needsAck(const uint8_t *packet) {
+    switch (packet[offsetof(proto::Header, msg_type)]) {
+        case proto::MSG_KEY_DOWN:
+        case proto::MSG_KEY_UP:
+        case proto::MSG_MODIFIER_SYNC:
+            return true;
+        case proto::MSG_MOUSE_MOVE: {
+            uint8_t buttons = packet[proto::HEADER_SIZE + offsetof(proto::MouseMove, buttons)];
+            bool changed = buttons != lastQueuedButtons;
+            lastQueuedButtons = buttons;
+            return changed;
+        }
+        default:
+            return false;
+    }
+}
+
 bool sendToPeer(const uint8_t *packet) {
     if (!isLinkUp() || txCount == TX_QUEUE_LEN) return false;
-    memcpy(txQueue[(txHead + txCount) % TX_QUEUE_LEN], packet, proto::PACKET_SIZE);
+    Outgoing &slot = txQueue[(txHead + txCount) % TX_QUEUE_LEN];
+    memcpy(slot.packet, packet, proto::PACKET_SIZE);
+    slot.needsAck = needsAck(packet);
     txCount++;
     return true;
 }
@@ -499,15 +596,27 @@ Totals totals() {
     Totals t = total;
     t.session = sessionGeneration;
     t.rxOverflow = rxOverflow;
-    t.framesSent = framesSent;
     t.framesAcked = framesAcked;
     t.framesFailed = framesFailed;
+    t.phyRate = phyRate;
     return t;
 }
 
-void setTxWindow(uint8_t window) {
-    txWindow = window;
-    Serial.printf("[radio] TX window set to %u (0 = no limit)\n", window);
+bool setPhyRate(uint8_t rate) {
+    static const uint8_t allowed[] = {
+        WIFI_PHY_RATE_1M_L, WIFI_PHY_RATE_2M_L, WIFI_PHY_RATE_5M_L, WIFI_PHY_RATE_11M_L,
+        WIFI_PHY_RATE_6M, WIFI_PHY_RATE_9M, WIFI_PHY_RATE_12M, WIFI_PHY_RATE_18M,
+        WIFI_PHY_RATE_24M, WIFI_PHY_RATE_36M, WIFI_PHY_RATE_48M, WIFI_PHY_RATE_54M,
+    };
+    bool ok = false;
+    for (uint8_t a : allowed) ok = ok || a == rate;
+    if (!ok || esp_wifi_config_espnow_rate(WIFI_IF_STA, (wifi_phy_rate_t)rate) != ESP_OK) {
+        Serial.printf("[radio] PHY rate 0x%02X rejected\n", rate);
+        return false;
+    }
+    phyRate = rate;
+    Serial.printf("[radio] PHY rate set to 0x%02X\n", rate);
+    return true;
 }
 
 }  // namespace radio_link

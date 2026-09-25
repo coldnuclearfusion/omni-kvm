@@ -35,7 +35,9 @@ void update();
 bool isLinkUp();
 
 // Queues a 64-byte protocol packet for the peer. Its header seq is
-// replaced with this board's radio sequence number. Returns false if
+// replaced with this board's radio sequence number. Input packets go out
+// one at a time; a key event (or mouse button change) whose delivery
+// fails is sent again before anything queued after it. Returns false if
 // the link is down or the queue is full.
 bool sendToPeer(const uint8_t *packet);
 
@@ -47,19 +49,20 @@ size_t sendQueueSpace();
 struct Totals {
     uint32_t session;           // session generation
     uint32_t inputSent;
-    uint32_t inputRetries;
+    uint32_t inputRetransmits;
+    uint32_t inputGaveUp;
     uint32_t inputReceived;
     uint32_t rxOverflow;
     uint32_t authFailures;
     uint32_t replaysDropped;
-    uint32_t framesSent;
     uint32_t framesAcked;
     uint32_t framesFailed;
+    uint8_t phyRate;
 };
 Totals totals();
 
-// Most input frames allowed in flight (sent, delivery not yet reported
-// by ESP-NOW). 0 = no limit. Development knob for burst experiments.
-void setTxWindow(uint8_t window);
+// Sets this board's radio TX rate (a wifi_phy_rate_t value). Returns
+// false for rates we don't allow. Development knob for range experiments.
+bool setPhyRate(uint8_t rate);
 
 }  // namespace radio_link

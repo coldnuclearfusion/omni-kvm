@@ -118,16 +118,17 @@ static void replyLinkStats() {
     s.status_id = proto::STATUS_LINK_STATS;
     s.layout = proto::LINK_STATS_LAYOUT;
     s.link_up = radio_link::isLinkUp();
+    s.phy_rate = t.phyRate;
     s.session = t.session;
     s.host_received = packetsFromHost;
     s.host_dropped = packetsDropped;
     s.radio_sent = t.inputSent;
-    s.radio_send_retries = t.inputRetries;
+    s.radio_retransmits = t.inputRetransmits;
+    s.radio_gave_up = t.inputGaveUp;
     s.radio_received = t.inputReceived;
     s.radio_rx_overflow = t.rxOverflow;
     s.auth_failures = t.authFailures;
     s.replays_dropped = t.replaysDropped;
-    s.frames_sent = t.framesSent;
     s.frames_acked = t.framesAcked;
     s.frames_failed = t.framesFailed;
     hid_output::Stats h = hid_output::stats();
@@ -145,8 +146,8 @@ static void handleDaemonCommand(const uint8_t *raw) {
     uint8_t command = raw[proto::HEADER_SIZE];
     if (command == proto::CMD_REQUEST_LINK_STATS) {
         replyLinkStats();
-    } else if (command == proto::CMD_SET_TX_WINDOW) {
-        radio_link::setTxWindow(raw[proto::HEADER_SIZE + 1]);
+    } else if (command == proto::CMD_SET_PHY_RATE) {
+        radio_link::setPhyRate(raw[proto::HEADER_SIZE + 1]);
     } else {
         Serial.printf("[host] unknown daemon command 0x%02X\n", command);
     }
