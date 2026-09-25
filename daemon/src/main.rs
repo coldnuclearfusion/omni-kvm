@@ -9,6 +9,7 @@
 //! left edge brings it back to Windows. Input capture on the Mac is next.
 
 mod board;
+mod focus;
 mod input;
 #[cfg(windows)]
 mod input_windows;

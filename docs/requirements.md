@@ -36,9 +36,11 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
   devices. Example: with the focus on the PC, typing a consonant on the
   PC keyboard and a vowel on the MacBook keyboard composes one Hangul
   syllable on the PC.
-- **B2. Split mode** at startup, and after the link is lost and when it
-  comes back. Shared mode starts with the user's first switch, so input
-  never moves to the other computer by itself.
+- **B2. Split mode** when both daemons start, and after the link is lost
+  and when it comes back. Shared mode starts with the user's first
+  switch, so input never moves to the other computer by itself. A single
+  daemon that restarts while the other keeps running (a crash and
+  automatic restart, say) rejoins the current state instead (S9).
 - **B3. Switching.**
   - (a) Push the pointer past the focused screen's facing edge (PC: right,
     Mac: left) by the edge resistance, with any device of either computer.
@@ -67,10 +69,12 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
     dropped.
   Mouse movement that would arrive late is dropped instead.
 - **B7. Latency** stays in single-digit milliseconds (target: 7 ms).
-- **B8. One side without its daemon.** With only the board plugged in, the
-  other computer can still take that computer over with the hotkey, as a
-  plain USB keyboard and mouse. Edge switching, pointer placement and
-  sharing that computer's own devices need its daemon.
+- **B8. One side without its daemon.** With only the board plugged in (at
+  the login screen before the daemon starts, on a computer where it
+  cannot be installed, or while it restarts), the other computer can
+  still take that computer over with the hotkey, as a plain USB keyboard
+  and mouse, and come back with the hotkey. Edge switching, pointer
+  placement and sharing that computer's own devices need its daemon.
 - **B9. Notifications** when the link is lost or restored and when the
   other daemon stops (as planned in `architecture.md`).
 - **B10. Keys by position.** The Windows key and Command are the same key,
@@ -87,14 +91,24 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
   cancelling a Cmd+Tab or Win+Tab switcher with Esc does not count.
 - **H2.** The PC keeps **Scroll Lock** too (Fn+Home on the owner's
   keyboard).
-- **H3. Meaning: move the focus to the other computer.** In split mode, the
-  focus goes to the computer opposite the keyboard used.
-- **H4. No side effects.** The hotkey must not also act as a plain Esc in
-  the app in front, nor open the Windows Start menu (which Windows opens
-  when it sees the Windows key pressed and released alone). How this is
-  done depends on experiment A7.
+- **H3. Each daemon watches its own keyboard, and its computer decides.**
+  If the focus is on the other computer, the hotkey brings it here; if
+  it is here, or in split mode, the hotkey moves it to the other
+  computer. So one keyboard alone can switch both ways, and it works even
+  when the other daemon is not running (B8).
+- **H4. No side effects.** By default the key that completes the hotkey
+  (Escape, Scroll Lock) reaches no computer, so it cannot act as a plain
+  Esc in an app. The modifier pressed first (Win, Command) goes out
+  before anyone can know Escape will follow, and is released at once;
+  that must not open the Windows Start menu (which Windows opens when it
+  sees the Windows key pressed and released alone). How depends on
+  experiment A7.
 - **H5. Later:** hotkeys become configurable, with a left-/right-handed
   choice.
+- **H6. Setting "pass the hotkey on"** (default: off). When on, the hotkey
+  still switches, and its keys are also delivered where they were going:
+  for example the PC's Scroll Lock reaches the Mac (as F14) while the
+  focus is on the Mac.
 
 ## Focus rules (S)
 
@@ -110,11 +124,11 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
   both computers. While they disagree it may reach neither.
 - **S5. Swallowing.** A daemon hides its own computer's input from that
   computer only while it sees the focus on the other computer.
-- **S6. Who decides.** In shared mode the focused computer decides every
-  switch: edge pushes on its screen, and the hotkey pressed on either
-  keyboard. The unfocused computer only forwards. In split mode each
-  computer decides for itself; if both switch at the same moment, the PC
-  wins. (See open question O1.)
+- **S6. Who decides.** An edge switch is decided by the computer whose
+  screen the pointer is pushed out of: the focused one in shared mode,
+  each for itself in split mode. A hotkey switch is decided by the
+  computer whose keyboard was used (H3). If two switches are decided at
+  the same moment, the PC's wins.
 - **S7. Link lost or board unplugged:** both computers are in split mode
   within T_link.
 - **S8. The other daemon stops** (no message for 3 s): the running side goes
@@ -122,9 +136,11 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
   input capture is gone with it), and its board accepts the other
   computer's input again (B8).
 - **S9. Restarts.** After either daemon or board restarts, the two agree
-  within about one keepalive interval once the link is back.
+  within about one keepalive interval once the link is back. A daemon
+  that restarts within the 3 s of S8 rejoins the current state; after a
+  longer absence the other side is already in split mode (S8).
 - **S10. There is always a way back.**
-  - The hotkey on the user's own keyboard (see O1).
+  - The hotkey on the user's own keyboard (H3).
   - Automatic split mode when the link or the other daemon fails.
   - Last resort: unplugging a board gives split mode within T_link.
 
@@ -208,13 +224,12 @@ The design is checked against all of these, alone and combined:
     full screen when Esc is held, did not leave it when Win was held
     together with Esc.
 
-## Open questions
+## Decided questions
 
-- **O1. Who decides a hotkey switch.** S6 lets the focused computer decide,
-  so a hotkey pressed on the unfocused keyboard is forwarded and decided
-  there; if the focused daemon is not answering, the way back is the S8
-  timeout. Letting the keyboard's own computer decide would work even
-  then. To be settled together with the state machine.
+- **O1. Who decides a hotkey switch** (decided 2026-09-26): the computer
+  whose keyboard was used (H3, S6). With the focused computer deciding,
+  a hotkey pressed while the focused computer has no daemon (B8) would
+  have had no one to decide it, and no way back but unplugging a board.
 
 ## Why this document exists
 
