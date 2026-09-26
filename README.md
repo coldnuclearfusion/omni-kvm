@@ -64,6 +64,7 @@ Wireless input is a sensitive channel. The threat model and mitigations are docu
 - [ ] **Phase 3** — Windows host daemon + virtual resistance UX
 - [ ] **Phase 4** — macOS host daemon + monitor layout negotiation
 - [ ] **Phase 5** — Fail-safe behavior, edge cases, pairing flow
+  - Replace the precompiled USB device driver (TinyUSB 0.16 `dcd_esp32sx`) with a corrected build, fixing its FIFO layout, unlocked register updates, its reset on an unknown interrupt flag and its reset handling at the source (see `docs/platform.md`, K1, K2, K6, K7); the firmware works around them for now
 - [ ] **Phase 6** — Mass storage installer, GitHub-based updates
 - [ ] **v1.1** — Linux X11 support
 - [ ] **v2.0** — Linux Wayland support

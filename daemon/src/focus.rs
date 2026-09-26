@@ -7,11 +7,7 @@
 //! returns (send a view, close the board's input gate, start forwarding,
 //! ...). Being pure, it can be run through every order of events by the
 //! model check in `focus/check.rs`, and the daemon then uses the very
-//! code that was checked.
-
-// The daemon switches over to this module after the model check passes
-// (docs/focus-design.md); until then only the check uses it.
-#![allow(dead_code)]
+//! code that was checked (through `hub.rs`).
 
 use std::collections::BTreeMap;
 
@@ -204,10 +200,6 @@ impl Machine {
         (m, out)
     }
 
-    pub fn me(&self) -> Node {
-        self.me
-    }
-
     pub fn view(&self) -> View {
         self.view
     }
@@ -220,6 +212,7 @@ impl Machine {
         self.mode == Mode::Unfocused
     }
 
+    #[cfg(test)]
     pub fn peer_heard(&self) -> bool {
         self.peer_heard
     }
@@ -330,6 +323,13 @@ impl Machine {
     /// before this daemon started goes to this computer.
     pub fn route_release(&mut self, id: u32) -> Route {
         self.pressed.remove(&id).unwrap_or(Route::Pass)
+    }
+
+    /// A held key repeats (auto-repeat): where its press went, which
+    /// stays as it was. One pressed before this daemon started goes to
+    /// this computer.
+    pub fn route_held(&self, id: u32) -> Route {
+        self.pressed.get(&id).copied().unwrap_or(Route::Pass)
     }
 
     /// Movement and scrolling: no memory needed.
@@ -452,7 +452,9 @@ mod tests {
         pc.handle(Event::Hotkey);
         pc.handle(Event::GateClosed(1));
         pc.handle(Event::SettleDone);
+        assert_eq!(pc.route_held(7), Route::Pass, "repeats follow the press too");
         assert_eq!(pc.route_release(7), Route::Pass, "pressed here, released here");
         assert_eq!(pc.route_press(8), Route::Forward);
+        assert_eq!(pc.route_held(8), Route::Forward);
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "omni-kvm-daemon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Omni-KVM host daemon: talks to the local board over USB and (later) captures and forwards keyboard/mouse input"
+description = "Omni-KVM host daemon: shares one keyboard-and-mouse focus between two computers through the boards"
 publish = false
 
 [[bin]]
@@ -22,3 +22,6 @@ windows-sys ={ version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Win
 lto = true
 codegen-units = 1
 strip = true
+# A half-dead input daemon (a thread gone while the hooks or event tap stay
+# installed) is worse than none: any panic ends the whole process.
+panic = "abort"

@@ -115,11 +115,6 @@ pub fn hid_usage(vk: u32, scan: u32, extended: bool) -> Option<u8> {
     Some(usage)
 }
 
-/// For modifier keys (HID 0xE0..=0xE7), the bit in the HID modifier byte.
-pub fn modifier_bit(usage: u8) -> Option<u8> {
-    (0xE0..=0xE7).contains(&usage).then(|| 1 << (usage - 0xE0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,13 +137,5 @@ mod tests {
         assert_eq!(hid_usage(0x68, 0x48, false), Some(0x60)); // keypad 8
         assert_eq!(hid_usage(0xA3, 0x1D, true), Some(0xE4)); // right Ctrl
         assert_eq!(hid_usage(0x5B, 0x5B, true), Some(0xE3)); // left Windows
-    }
-
-    #[test]
-    fn modifier_bits_match_the_hid_modifier_byte() {
-        assert_eq!(modifier_bit(0xE0), Some(0x01)); // left Ctrl
-        assert_eq!(modifier_bit(0xE1), Some(0x02)); // left Shift
-        assert_eq!(modifier_bit(0xE7), Some(0x80)); // right GUI
-        assert_eq!(modifier_bit(0x04), None);
     }
 }

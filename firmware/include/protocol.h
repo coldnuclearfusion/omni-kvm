@@ -29,12 +29,13 @@ enum MsgType : uint8_t {
     MSG_KEY_UP           = 0x04,
     MSG_MODIFIER_SYNC    = 0x05,
     MSG_INPUT_ACK        = 0x06,   // receiver -> sender: "input packet <seq> processed"
-    MSG_HANDOFF          = 0x10,
-    MSG_HANDOFF_ACK      = 0x11,
-    MSG_EDGE_CONTACT     = 0x12,   // daemon to daemon; relayed, never read by the firmware
+    MSG_KEY_STATE        = 0x07,   // keys and buttons still held (repairs lost releases)
+    MSG_VIEW             = 0x10,   // daemon to daemon; relayed, never read by the firmware
+    MSG_BOARD_REPORT     = 0x1E,   // development: a board's diagnostic report, for the other host
     MSG_HEARTBEAT        = 0x20,
     MSG_HEARTBEAT_ACK    = 0x21,
     MSG_SESSION_HELLO    = 0x22,
+    MSG_HOST_GONE        = 0x23,   // board to board: my daemon disconnected
     MSG_PAIR_REQUEST     = 0x30,
     MSG_PAIR_CHALLENGE   = 0x31,
     MSG_PAIR_CONFIRM     = 0x32,
@@ -48,13 +49,14 @@ enum MsgType : uint8_t {
     MSG_DFU_ENTER        = 0xFF,
 };
 
-// Keyboard/mouse input: forwarded from the active side to the peer
-// and injected there as HID reports.
+// Keyboard/mouse input: forwarded from the computer whose daemon
+// forwards its own input, and typed in on the other side while that
+// board's input gate is open (shared/protocol.md, "Input gate").
 inline bool isInputMessage(uint8_t msgType) {
-    return msgType >= MSG_MOUSE_MOVE && msgType <= MSG_MODIFIER_SYNC;
+    return (msgType >= MSG_MOUSE_MOVE && msgType <= MSG_MODIFIER_SYNC) || msgType == MSG_KEY_STATE;
 }
 
-// Messages between the two daemons (handoff 0x10–0x1F, lock 0x50–0x5F).
+// Messages between the two daemons (focus 0x10–0x1F, lock 0x50–0x5F).
 // The boards pass them along without reading them: host → board → radio
 // → peer board → peer's host. Whole ranges, so new daemon messages need
 // no firmware change. Only the first 28 bytes after the header survive
@@ -73,6 +75,15 @@ constexpr uint8_t FLAG_ENCRYPTED     = 1 << 2;
 constexpr size_t NONCE_SIZE = 12;
 constexpr size_t TAG_SIZE = 16;
 constexpr size_t SEALED_DATA_SIZE = PAYLOAD_SIZE - NONCE_SIZE - TAG_SIZE;   // 28
+
+// Can this packet cross the radio? Only its first SEALED_DATA_SIZE data
+// bytes are sealed, so everything after them must be zero.
+inline bool fitsSealedData(const uint8_t *packet) {
+    for (size_t i = HEADER_SIZE + SEALED_DATA_SIZE; i < PACKET_SIZE; i++) {
+        if (packet[i] != 0) return false;
+    }
+    return true;
+}
 
 // "packed" tells the compiler not to insert padding bytes between
 // fields, so the struct matches the byte layout in protocol.md.
@@ -105,6 +116,14 @@ struct __attribute__((packed)) ModifierSync {
     uint8_t modifiers;
 };
 
+// MSG_KEY_STATE: what the sender still holds down that it forwarded. The
+// receiving board lets go of anything else it holds for the sender.
+struct __attribute__((packed)) KeyState {
+    uint8_t modifiers;  // USB HID modifier bitfield
+    uint8_t buttons;    // as in MouseMove
+    uint8_t keys[6];    // HID usages, 0 = none
+};
+
 // MSG_SESSION_HELLO: session handshake, sealed with the long-term key.
 // See shared/protocol.md ("Sessions").
 constexpr size_t SESSION_NONCE_SIZE = 12;
@@ -121,7 +140,14 @@ static_assert(sizeof(SessionHello) <= SEALED_DATA_SIZE, "HELLO must fit in a sea
 // over USB CDC only, never over the radio (so not limited to 28 bytes).
 constexpr uint8_t CMD_REQUEST_LINK_STATS = 0x04;
 constexpr uint8_t CMD_SET_PHY_RATE = 0x07;      // development: data[0] = wifi_phy_rate_t
+constexpr uint8_t CMD_GATE_OPEN = 0x08;
+constexpr uint8_t CMD_GATE_CLOSE = 0x09;        // data[0] = request number
+constexpr uint8_t CMD_USB_GUARD = 0x0A;         // development: data[0] = 1 prevent, 3 board
+                                                // reports, 4 log FIFO layout, 7 host filler;
+                                                // data[1] = 1 on, 0 off
 constexpr uint8_t STATUS_LINK_STATS = 0x03;
+constexpr uint8_t STATUS_LINK_CHANGED = 0x05;   // data[0] = 1 up, 0 down
+constexpr uint8_t STATUS_GATE_CLOSED = 0x06;    // data[0] = the request number it answers
 constexpr uint8_t LINK_STATS_LAYOUT = 3;        // bump whenever LinkStats changes
 
 // Counters since boot. "host_*" are input packets from this board's host;

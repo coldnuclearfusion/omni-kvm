@@ -1,218 +1,207 @@
 //! Windows input capture: low-level hooks plus Raw Input.
 //!
-//! **Local** mode: input goes to Windows as usual; we only watch it.
-//! Pushing the pointer past the right edge of the screen (with some
-//! "virtual resistance") switches to **Remote** mode: keyboard and mouse
-//! input is swallowed, so Windows never sees it, and forwarded to the
-//! board as protocol events. If the Mac's daemon is running, a handoff
-//! puts the Mac pointer at the same height, and pushing it past the Mac's
-//! left edge comes back. Scroll Lock toggles between the two modes, and
-//! a lost radio link falls back to Local.
+//! Every keyboard and mouse event is routed by the focus state machine
+//! (through hub.rs): passed to Windows, swallowed and forwarded to the
+//! board, or swallowed and dropped. That includes what the board types in
+//! for the Mac: Windows reports it like the PC's own devices, and the
+//! design does not need the two told apart. The hooks decide what Windows
+//! gets to see and forward keys, buttons and the wheel; forwarded movement
+//! comes from Raw Input, which reports what the mouse counted before
+//! Windows' pointer acceleration (the Mac applies its own).
 //!
-//! Mouse movement comes from Raw Input: the counts the mouse reported,
-//! before Windows pointer acceleration, because the Mac applies its own
-//! (see shared/protocol.md, "Keep batching windows short").
+//! While input passes to Windows, pushing the pointer past the screen's
+//! right edge by EDGE_RESISTANCE moves the focus to the Mac; so does the
+//! hotkey (Win+Esc or Scroll Lock), which also brings it back.
 //!
-//! This module never records what is typed: in Local mode it only tracks
-//! which keys are held, so they can be released cleanly on a switch.
+//! This module never records what is typed: it only tracks which keys are
+//! held, to route their repeats and releases.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SCROLL;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_SCROLL,
+};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::input::Event;
+use crate::focus::{Entry, Event, Route};
+use crate::hotkey;
+use crate::hub::{Guard, Hub};
+use crate::input;
 use crate::keymap;
-use crate::peer::{self, Peer, PeerMsg};
+use crate::protocol::{self, msg};
+use crate::screen_windows::{cursor_pos, virtual_screen};
 
-/// Raw mouse counts pushed against an edge before switching.
-const EDGE_RESISTANCE: i32 = 60;
-/// Sent on entering Remote when the Mac has no daemon to place its
-/// pointer, so it at least starts somewhere on the left edge.
-const SLAM_LEFT: i32 = -5000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Local,
-    Remote,
-}
+/// Raw mouse counts pushed against the right edge before switching.
+const EDGE_RESISTANCE: i32 = 50;
+/// Setting H6, "pass the hotkey on" (default off): the key completing the
+/// hotkey is also delivered where input was going. To become a setting.
+const PASS_HOTKEY_ON: bool = false;
+/// A key-down this long after the key's previous event is a new press
+/// whose release the hook never saw (it went to the lock screen, say), not
+/// an auto-repeat: Windows repeats a held key within 1 s at the slowest.
+const REPEAT_GAP_MS: u32 = 1500;
+const VK_LWIN: u32 = 0x5B;
+const VK_RWIN: u32 = 0x5C;
+/// An unassigned virtual-key code: tapping it counts as "another key" for
+/// Windows without doing anything (see `tap_mask_key`).
+const VK_MASK: u16 = 0xE8;
 
 struct State {
-    mode: Mode,
-    tx: Sender<Event>,
-    peer: Arc<Peer>,
-    handoff_id: u8,
-    // Local mode
-    local_keys: HashSet<u32>, // virtual-key codes held on Windows
-    local_buttons: u8,
+    hub: Arc<Hub>,
+    hotkey: hotkey::Watch,
+    /// Keys down as the hook saw them, with the time of their last event.
+    held: HashMap<u32, u32>,
+    /// Keys that completed the hotkey: kept from everyone, their repeats
+    /// and release too (H4).
+    kept: HashSet<u32>,
+    /// Modifiers and buttons forwarded and still held: the byte each
+    /// forwarded key or mouse event carries.
+    fwd_modifiers: u8,
+    fwd_buttons: u8,
+    /// Windows keys that Windows saw go down and not yet up (bit 0 left,
+    /// bit 1 right), and whether the mask key was tapped since.
+    windows_keys: u8,
+    masked: bool,
+    /// The hooks' latest decision about pointer movement (see on_raw_motion).
+    motion_route: Route,
     edge_push: i32,
-    // Remote mode: pushing past the Mac's left edge
-    return_push: i32,
-    // Remote mode
-    keys_held_at_switch: HashSet<u32>, // their key-up must still reach Windows
-    buttons_held_at_switch: u8,
-    remote_keys: HashSet<u8>, // HID usages held on the remote side
-    modifiers: u8,
-    buttons: u8,
     wheel: i32,
     hwheel: i32,
-    entry_y: i32,
-    scroll_lock_held: bool,
 }
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
-/// Something to do after the state borrow is released (Win32 calls that
-/// could, in principle, re-enter our hooks).
-enum After {
-    Nothing,
-    MoveCursor(i32, i32),
-}
-
-fn virtual_screen() -> (i32, i32, i32, i32) {
-    unsafe {
-        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        (x, y, x + w - 1, y + h - 1) // left, top, right, bottom
+fn windows_key_bit(vk: u32) -> u8 {
+    match vk {
+        VK_LWIN => 1,
+        VK_RWIN => 2,
+        _ => 0,
     }
 }
 
-fn cursor_pos() -> POINT {
-    let mut p = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut p) };
-    p
+/// Payload of MSG_MOUSE_MOVE.
+fn mouse_payload(dx: i32, dy: i32, buttons: u8) -> [u8; 5] {
+    let clamp = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    let [x0, x1] = clamp(dx).to_le_bytes();
+    let [y0, y1] = clamp(dy).to_le_bytes();
+    [x0, x1, y0, y1, buttons]
 }
 
 impl State {
-    fn send(&self, event: Event) {
-        let _ = self.tx.send(event); // the board thread is gone only when we are exiting
+    /// Keyboard hook. Returns (Windows gets the event, tap the mask key).
+    fn on_key(&mut self, vk: u32, scan: u32, extended: bool, down: bool, time: u32) -> (bool, bool) {
+        let usage = keymap::hid_usage(vk, scan, extended);
+        let id = input::key_id(usage, vk);
+        let hub = self.hub.clone();
+        let mut g = hub.lock();
+        let mut mask = false;
+        if !down {
+            self.held.remove(&id);
+            return (self.release(&mut g, id, usage, vk), false);
+        }
+        match self.held.insert(id, time) {
+            Some(last) if time.wrapping_sub(last) < REPEAT_GAP_MS => {
+                // Auto-repeat: where the press went. The other computer
+                // repeats held keys on its own.
+                let pass = !self.kept.contains(&id) && g.route_held(id) == Route::Pass;
+                return (pass, false);
+            }
+            // Its release never reached the hook: settle that first.
+            Some(_) => {
+                self.release(&mut g, id, usage, vk);
+            }
+            None => {}
+        }
+        let pass = self.press(&mut g, id, usage, vk, &mut mask);
+        (pass, mask)
     }
 
-    fn enter_remote(&mut self) {
-        if !self.peer.link_up() {
-            println!("[input] radio link is down; staying on Windows");
-            return;
+    /// A new key press. Returns whether Windows gets it.
+    fn press(&mut self, g: &mut Guard, id: u32, usage: Option<u8>, vk: u32, mask: &mut bool) -> bool {
+        let gui_escape = self.hotkey.press(usage);
+        let completes = gui_escape || vk == VK_SCROLL as u32;
+        if completes && !PASS_HOTKEY_ON {
+            self.kept.insert(id);
+            *mask |= self.withheld();
+            g.handle(Event::Hotkey);
+            return false;
         }
-        self.mode = Mode::Remote;
-        self.keys_held_at_switch = self.local_keys.clone();
-        self.buttons_held_at_switch = self.local_buttons;
-        self.remote_keys.clear();
-        self.modifiers = 0;
-        self.buttons = 0;
-        self.wheel = 0;
-        self.hwheel = 0;
-        self.return_push = 0;
-        self.entry_y = cursor_pos().y;
-        if self.peer.daemon_alive() {
-            // The Mac pointer moves away from wherever it was: forget any
-            // edge it touched until the Mac reports again.
-            self.peer.set_contact(0, 0);
-            self.handoff_id = self.handoff_id.wrapping_add(1);
-            let (_, top, _, bottom) = virtual_screen();
-            let position = peer::fraction(self.entry_y as f64, top as f64, bottom as f64);
-            self.send(Event::Peer(PeerMsg::Handoff { edge: peer::EDGE_RIGHT, id: self.handoff_id, position }));
-            println!("[input] -> Mac  (push past its left edge, or Scroll Lock, to come back)");
-        } else {
-            self.send(Event::Mouse { dx: SLAM_LEFT, dy: 0, buttons: 0 });
-            println!("[input] -> Mac  (Scroll Lock to come back; start the Mac daemon to use its left edge)");
-        }
-    }
-
-    /// Releases everything held on the remote side and gives input back to
-    /// Windows, with the pointer at height `y` (default: where it left).
-    fn leave_remote(&mut self, why: &str, y: Option<i32>) -> After {
-        for &usage in &self.remote_keys {
-            self.send(Event::Key { usage, down: false, modifiers: 0 });
-        }
-        self.send(Event::ModifierSync(0));
-        if self.buttons != 0 {
-            self.send(Event::Mouse { dx: 0, dy: 0, buttons: 0 });
-        }
-        self.remote_keys.clear();
-        self.modifiers = 0;
-        self.buttons = 0;
-        self.mode = Mode::Local;
-        self.edge_push = 0;
-        println!("[input] <- Windows ({why})");
-        let (_, _, right, _) = virtual_screen();
-        After::MoveCursor(right - 40, y.unwrap_or(self.entry_y)) // a little away from the edge
-    }
-
-    fn check_link(&mut self) -> After {
-        if self.mode == Mode::Remote && !self.peer.link_up() {
-            return self.leave_remote("radio link lost", None);
-        }
-        After::Nothing
-    }
-
-    /// Returns (swallow, after).
-    fn on_key(&mut self, vk: u32, scan: u32, extended: bool, down: bool) -> (bool, After) {
-        if vk == VK_SCROLL as u32 {
-            let mut after = After::Nothing;
-            if down && !self.scroll_lock_held {
-                after = match self.mode {
-                    Mode::Local => {
-                        self.enter_remote();
-                        After::Nothing
+        let route = g.route_press(id);
+        match route {
+            Route::Pass => {
+                let bit = windows_key_bit(vk);
+                if bit != 0 {
+                    if self.windows_keys == 0 {
+                        self.masked = false;
                     }
-                    Mode::Remote => self.leave_remote("Scroll Lock", None),
-                };
+                    self.windows_keys |= bit;
+                }
             }
-            self.scroll_lock_held = down;
-            return (true, after); // never let Scroll Lock itself through
-        }
-
-        if down {
-            self.local_keys.insert(vk);
-        } else {
-            self.local_keys.remove(&vk);
-        }
-
-        let after = self.check_link();
-        if self.mode == Mode::Local {
-            return (false, after);
-        }
-        // A key pressed on Windows before the switch: Windows must see it go up.
-        if !down && self.keys_held_at_switch.remove(&vk) {
-            return (false, after);
-        }
-        let Some(usage) = keymap::hid_usage(vk, scan, extended) else {
-            return (true, after); // unknown key: swallow, don't forward
-        };
-        if let Some(bit) = keymap::modifier_bit(usage) {
-            if down {
-                self.modifiers |= bit;
-            } else {
-                self.modifiers &= !bit;
+            Route::Forward => {
+                self.forward_key(g, usage, true);
+                *mask |= self.withheld();
             }
-        } else if down {
-            if !self.remote_keys.insert(usage) {
-                return (true, after); // Windows auto-repeat; the Mac repeats on its own
-            }
-        } else {
-            self.remote_keys.remove(&usage);
+            Route::Drop => *mask |= self.withheld(),
         }
-        self.send(Event::Key { usage, down, modifiers: self.modifiers });
-        (true, after)
+        if completes {
+            g.handle(Event::Hotkey);
+        }
+        route == Route::Pass
     }
 
-    /// Low-level mouse hook: decides what Windows gets to see.
-    fn on_mouse_hook(&mut self, msg: u32, mouse_data: u32) -> bool {
-        let button = match msg {
+    /// A key release. Returns whether Windows gets it.
+    fn release(&mut self, g: &mut Guard, id: u32, usage: Option<u8>, vk: u32) -> bool {
+        self.hotkey.release(usage);
+        if self.kept.remove(&id) {
+            return false;
+        }
+        let route = g.route_release(id);
+        match route {
+            Route::Pass => self.windows_keys &= !windows_key_bit(vk),
+            Route::Forward => self.forward_key(g, usage, false),
+            Route::Drop => {}
+        }
+        route == Route::Pass
+    }
+
+    /// A key press Windows does not get. Windows opens the Start menu when
+    /// a Windows key goes up with no other key since it went down, so if
+    /// it holds one, it must see some other key first: returns true to tap
+    /// the mask key (once per Windows-key press).
+    fn withheld(&mut self) -> bool {
+        let tap = self.windows_keys != 0 && !self.masked;
+        self.masked |= tap;
+        tap
+    }
+
+    fn forward_key(&mut self, g: &Guard, usage: Option<u8>, down: bool) {
+        let Some(usage) = usage else { return }; // no HID usage: swallowed only
+        if let Some(bit) = input::modifier_bit(usage) {
+            if down {
+                self.fwd_modifiers |= bit;
+            } else {
+                self.fwd_modifiers &= !bit;
+            }
+        }
+        g.forward(if down { msg::KEY_DOWN } else { msg::KEY_UP }, [usage, self.fwd_modifiers, 0, 0, 0]);
+    }
+
+    /// Low-level mouse hook. Returns whether Windows gets the event.
+    fn on_mouse_hook(&mut self, message: u32, mouse_data: u32) -> bool {
+        let hub = self.hub.clone();
+        let mut g = hub.lock();
+        let button = match message {
             WM_LBUTTONDOWN | WM_LBUTTONUP => 0x01,
             WM_RBUTTONDOWN | WM_RBUTTONUP => 0x02,
             WM_MBUTTONDOWN | WM_MBUTTONUP => 0x04,
@@ -221,116 +210,113 @@ impl State {
             }
             _ => 0,
         };
-        let down = matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
         if button != 0 {
-            if down {
-                self.local_buttons |= button;
-            } else {
-                self.local_buttons &= !button;
+            let down = matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
+            let id = input::button_id(button);
+            let route = if down { g.route_press(id) } else { g.route_release(id) };
+            if route == Route::Forward {
+                if down {
+                    self.fwd_buttons |= button;
+                } else {
+                    self.fwd_buttons &= !button;
+                }
+                g.forward(msg::MOUSE_MOVE, mouse_payload(0, 0, self.fwd_buttons));
             }
+            return route == Route::Pass;
         }
-        if self.mode == Mode::Local {
-            return false;
+        let route = g.route_motion();
+        match message {
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                if route == Route::Forward {
+                    self.forward_wheel(&g, message == WM_MOUSEHWHEEL, (mouse_data >> 16) as u16 as i16);
+                }
+            }
+            _ => self.motion_route = route,
         }
-        // A button pressed on Windows before the switch: Windows must see it go up.
-        if button != 0 && !down && self.buttons_held_at_switch & button != 0 {
-            self.buttons_held_at_switch &= !button;
-            return false;
-        }
-        true // Remote: Windows sees no pointer movement, clicks, or wheel
+        route == Route::Pass
     }
 
-    /// Raw Input: what the mouse actually reported, before acceleration.
-    fn on_raw_mouse(&mut self, dx: i32, dy: i32, flags: u32, data: i16) -> After {
-        let after = self.check_link();
-        if self.mode == Mode::Local {
-            let (_, _, right, _) = virtual_screen();
-            if cursor_pos().x >= right && dx > 0 {
-                self.edge_push += dx;
-                if self.edge_push >= EDGE_RESISTANCE {
-                    self.enter_remote();
-                }
-            } else if dx < 0 || cursor_pos().x < right {
+    /// WHEEL_DELTA (120) per notch; high-resolution wheels send less.
+    fn forward_wheel(&mut self, g: &Guard, horizontal: bool, delta: i16) {
+        let rest = if horizontal { &mut self.hwheel } else { &mut self.wheel };
+        *rest += delta as i32;
+        let notches = (*rest / WHEEL_DELTA as i32) as i16;
+        *rest -= notches as i32 * WHEEL_DELTA as i32;
+        if notches != 0 {
+            // Both positive = up / right, as in MSG_MOUSE_SCROLL.
+            let (v, h) = if horizontal { (0, notches) } else { (notches, 0) };
+            let [v0, v1] = v.to_le_bytes();
+            let [h0, h1] = h.to_le_bytes();
+            g.forward(msg::MOUSE_SCROLL, [v0, v1, h0, h1, 0]);
+        }
+    }
+
+    /// Raw Input: what the mouse counted, before acceleration.
+    fn on_raw_motion(&mut self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let hub = self.hub.clone();
+        let mut g = hub.lock();
+        match g.route_motion() {
+            // Only while the hooks swallow movement too: Raw Input can lag
+            // behind the hooks, and movement Windows was given must not be
+            // sent to the Mac as well.
+            Route::Forward if self.motion_route == Route::Forward => {
+                g.forward(msg::MOUSE_MOVE, mouse_payload(dx, dy, self.fwd_buttons));
+            }
+            Route::Pass => return self.watch_edge(&mut g, dx),
+            _ => {}
+        }
+        self.edge_push = 0;
+    }
+
+    /// Pushing past the right edge, by any device (the Mac's too, typed in
+    /// by the board), moves the focus to the Mac.
+    fn watch_edge(&mut self, g: &mut Guard, dx: i32) {
+        let (_, top, right, bottom) = virtual_screen();
+        let p = cursor_pos();
+        if p.x >= right && dx > 0 {
+            self.edge_push += dx;
+            if self.edge_push >= EDGE_RESISTANCE {
                 self.edge_push = 0;
+                let height = protocol::fraction(p.y as f64, top as f64, bottom as f64);
+                g.handle(Event::EdgePushed(Entry { height }));
             }
-            return after;
+        } else if dx < 0 || p.x < right {
+            self.edge_push = 0;
         }
-
-        let before = self.buttons;
-        for (down_flag, up_flag, bit) in [
-            (RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, 0x01u8),
-            (RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, 0x02),
-            (RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, 0x04),
-            (RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, 0x08),
-            (RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, 0x10),
-        ] {
-            if flags & down_flag != 0 {
-                self.buttons |= bit;
-            }
-            if flags & up_flag != 0 {
-                self.buttons &= !bit;
-            }
-        }
-        if dx != 0 || dy != 0 || self.buttons != before {
-            self.send(Event::Mouse { dx, dy, buttons: self.buttons });
-        }
-
-        // Pushing past the Mac's left edge: the Mac daemon reports when its
-        // pointer touches the edge, and further leftward counts build up
-        // to the same resistance as on the way over.
-        if let Some(position) = self.peer.touching(peer::CONTACT_LEFT) {
-            if dx < 0 {
-                self.return_push -= dx;
-                if self.return_push >= EDGE_RESISTANCE {
-                    let (_, top, _, bottom) = virtual_screen();
-                    let y = peer::from_fraction(position, top as f64, bottom as f64).round() as i32;
-                    return self.leave_remote("Mac's left edge", Some(y));
-                }
-            } else if dx > 0 {
-                self.return_push = 0;
-            }
-        } else {
-            self.return_push = 0;
-        }
-
-        // Wheel: WHEEL_DELTA (120) per notch; high-resolution wheels send less.
-        let (mut vertical, mut horizontal) = (0i16, 0i16);
-        if flags & RI_MOUSE_WHEEL != 0 {
-            self.wheel += data as i32;
-            vertical = (self.wheel / WHEEL_DELTA as i32) as i16;
-            self.wheel -= vertical as i32 * WHEEL_DELTA as i32;
-        }
-        if flags & RI_MOUSE_HWHEEL != 0 {
-            self.hwheel += data as i32;
-            horizontal = (self.hwheel / WHEEL_DELTA as i32) as i16;
-            self.hwheel -= horizontal as i32 * WHEEL_DELTA as i32;
-        }
-        if vertical != 0 || horizontal != 0 {
-            self.send(Event::Scroll { vertical, horizontal });
-        }
-        after
     }
 }
 
-fn apply(after: After) {
-    if let After::MoveCursor(x, y) = after {
-        unsafe { SetCursorPos(x, y) };
-    }
+/// Taps the unassigned key for Windows alone (our hooks let injected input
+/// through), so that the release of a Windows key it holds does not look
+/// like a lone tap and open the Start menu. AutoHotkey uses the same key
+/// for the same purpose.
+fn tap_mask_key() {
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_MASK, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    let inputs = [key(0), key(KEYEVENTF_KEYUP)];
+    unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        // Leave input injected by other software alone.
+        // Leave injected input alone: other software's, and our mask key.
         if kb.flags & LLKHF_INJECTED == 0 {
             let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let extended = kb.flags & LLKHF_EXTENDED != 0;
             let result = STATE.with(|s| {
-                s.borrow_mut().as_mut().map(|st| st.on_key(kb.vkCode, kb.scanCode, extended, down))
+                s.borrow_mut().as_mut().map(|st| st.on_key(kb.vkCode, kb.scanCode, extended, down, kb.time))
             });
-            if let Some((swallow, after)) = result {
-                apply(after);
-                if swallow {
+            if let Some((pass, mask)) = result {
+                if mask {
+                    tap_mask_key();
+                }
+                if !pass {
                     return 1;
                 }
             }
@@ -343,10 +329,10 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code == HC_ACTION as i32 {
         let ms = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
         if ms.flags & LLMHF_INJECTED == 0 {
-            let swallow = STATE.with(|s| {
-                s.borrow_mut().as_mut().is_some_and(|st| st.on_mouse_hook(wparam as u32, ms.mouseData))
+            let pass = STATE.with(|s| {
+                s.borrow_mut().as_mut().is_none_or(|st| st.on_mouse_hook(wparam as u32, ms.mouseData))
             });
-            if swallow {
+            if !pass {
                 return 1;
             }
         }
@@ -354,8 +340,8 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
-unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_INPUT {
+unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message == WM_INPUT {
         let mut raw: RAWINPUT = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<RAWINPUT>() as u32;
         let read = unsafe {
@@ -367,23 +353,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 std::mem::size_of::<RAWINPUTHEADER>() as u32,
             )
         };
-        if read != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE {
+        // Injected input has no device; absolute devices (pen tablets,
+        // remote desktop) are not forwarded.
+        if read != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE && !raw.header.hDevice.is_null() {
             let m = unsafe { raw.data.mouse };
-            // Absolute devices (pen tablets, remote desktop) are not forwarded.
             if m.usFlags & MOUSE_MOVE_ABSOLUTE == 0 {
-                let (flags, data) = unsafe { (m.Anonymous.Anonymous.usButtonFlags, m.Anonymous.Anonymous.usButtonData) };
-                let after = STATE.with(|s| {
-                    s.borrow_mut()
-                        .as_mut()
-                        .map(|st| st.on_raw_mouse(m.lLastX, m.lLastY, flags as u32, data as i16))
+                STATE.with(|s| {
+                    if let Some(st) = s.borrow_mut().as_mut() {
+                        st.on_raw_motion(m.lLastX, m.lLastY);
+                    }
                 });
-                if let Some(after) = after {
-                    apply(after);
-                }
             }
         }
     }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -393,26 +376,21 @@ fn wide(s: &str) -> Vec<u16> {
 /// Installs the hooks and runs the message loop on the calling thread,
 /// which must be the thread that keeps pumping messages. Never returns
 /// normally; the hooks disappear with the process.
-pub fn run(tx: Sender<Event>, peer: Arc<Peer>) -> Result<(), String> {
+pub fn run(hub: Arc<Hub>) -> Result<(), String> {
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
-            mode: Mode::Local,
-            tx,
-            peer,
-            handoff_id: 0,
-            local_keys: HashSet::new(),
-            local_buttons: 0,
+            hub,
+            hotkey: hotkey::Watch::default(),
+            held: HashMap::new(),
+            kept: HashSet::new(),
+            fwd_modifiers: 0,
+            fwd_buttons: 0,
+            windows_keys: 0,
+            masked: false,
+            motion_route: Route::Pass,
             edge_push: 0,
-            return_push: 0,
-            keys_held_at_switch: HashSet::new(),
-            buttons_held_at_switch: 0,
-            remote_keys: HashSet::new(),
-            modifiers: 0,
-            buttons: 0,
             wheel: 0,
             hwheel: 0,
-            entry_y: 0,
-            scroll_lock_held: false,
         })
     });
 
@@ -467,12 +445,12 @@ pub fn run(tx: Sender<Event>, peer: Arc<Peer>) -> Result<(), String> {
         if kb.is_null() || ms.is_null() {
             return Err("SetWindowsHookExW failed".into());
         }
-        println!("[input] watching keyboard and mouse. Push the pointer past the right edge (or press Scroll Lock) to control the Mac.");
+        say!("[input] watching keyboard and mouse. Push the pointer past the right edge, or press Win+Esc or Scroll Lock, to switch.");
 
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
         UnhookWindowsHookEx(kb);
         UnhookWindowsHookEx(ms);

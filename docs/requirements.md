@@ -186,6 +186,23 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
 - **D7.** A key's release goes where its press went, even if the focus
   changed in between.
 
+## Platform (P)
+
+- **P1. Know the platform first.** Every design or code decision that
+  depends on the board, the chip or the software under the firmware
+  (Arduino core, ESP-IDF, TinyUSB) rests on a fact written in
+  [platform.md](platform.md) with its source: an official document, a file
+  of the toolchain as installed, or a dated measurement. A fact not known
+  yet is measured before it is relied on.
+- **P2.** Known defects underneath the firmware are listed there with how
+  the firmware handles each, and the handling is tested.
+- **P3.** The longest wait of every blocking call the firmware makes
+  (F1) is taken from there.
+
+Added 2026-09-26, after the board kept stopping under load (A5) because
+the USB driver underneath lays out its FIFOs wrongly, which nobody had
+checked before building on it.
+
 ## Failure model
 
 The design is checked against all of these, alone and combined:
@@ -209,20 +226,58 @@ The design is checked against all of these, alone and combined:
 - **A2.** Two keyboards typing into one computer: Hangul composes correctly
   on Windows and macOS, and a modifier held on one keyboard applies to
   keys on the other.
+  - Result (2026-09-26, `tools/experiments/two_keyboards.py`): Hangul
+    composes on both, whichever keyboard types which letter. A Shift held
+    by the board applies to the other keyboard's keys **on Windows but
+    not on macOS** (ㄱ instead of ㄲ): macOS keeps modifier state per
+    keyboard.
+  - Decided (2026-09-26): the Mac daemon adds the modifiers held on every
+    keyboard to input passed to the Mac (its event tap changes the
+    events' flags). To check with the new daemon.
 - **A3.** On Windows, mouse movement typed in by the board is visible to the
   daemon (Raw Input), so edge pushes with the Mac's trackpad count.
+  - Seen (2026-09-25): during Phase 4 testing the PC daemon took the
+    Mac trackpad's movement, typed in by the board, for a push past the
+    PC's right edge.
 - **A4.** The Mac event tap was switched off because the tap callback moved
   the pointer (hypothesis); doing that on a worker thread stops it.
 - **A5.** The board stopped sending to its computer because data was left in
   the USB transmit buffer without a flush (hypothesis). Reproduce with the
   old firmware under load; check the new firmware does not do it.
+  - Reproduced (2026-09-26): with the PC sending ~620 packets/s and asking
+    for stats every 50 ms, the board kept answering for 60 s; with the
+    other board also relaying 100 messages/s to it, it stopped answering
+    after about 3 s and never recovered (only a power cycle helped).
+  - The hypothesis was wrong (2026-09-26): firmware 0.5.0, which flushes
+    regularly, stopped too, after 0.5 s. It reproduces with one board
+    alone (no radio), sending ~930 packets/s and asking for stats 120
+    times a second: stopped after 3.5 s and 13 s (once not within 20 s).
+    Diagnostic reports from the stuck board showed its serial IN endpoint
+    holding a packet it never sent; a dump of the USB core's registers
+    showed why: the Arduino core's USB driver places the transmit FIFOs in
+    use outside the FIFO memory, over the receive FIFO (details in
+    `firmware/include/usb_guard.h` and `shared/protocol.md`,
+    MSG_BOARD_REPORT). Firmware 0.5.1 lays the FIFOs out itself.
+  - Checked (2026-09-26), same load, one board: no stop in 600 s
+    (67,637 replies, longest gap 23 ms). Still to check: both boards with
+    the radio relay, as first reproduced.
 - **A6.** The longest stall HID reports and log output can cause on a board.
 - **A7.** Hotkey side effects: does Win+Esc or Command+Esc reach the app in
   front as Esc? Does the Start menu open after the hotkey? Is Command+Esc
   unused on macOS 27?
-  - Preliminary (2026-09-26): a browser in F11 full screen, which leaves
-    full screen when Esc is held, did not leave it when Win was held
-    together with Esc.
+  - Result (2026-09-26, nothing intercepting): on Windows, a browser in
+    full screen ignores Win+Esc, but the Start menu and a game (Wuthering
+    Waves) act on it as Esc. So the daemon must keep the Escape from
+    apps (H4). On macOS, Command+Esc seems not to act as Esc (partly
+    tested).
+- **A8.** On Windows, an app that reads the keyboard and mouse directly (Raw
+  Input, common in games) may still receive input the daemon's hooks
+  swallow. Then keeping the hotkey's Escape from such an app is not
+  possible (A7), and while the PC is unfocused such an app would still
+  react to the PC's own devices (against S4 for that app). The daemon
+  itself receives Raw Input for mouse movement its hook swallowed, which
+  suggests this; similar tools are known to have the same limitation.
+  Check with a game.
 
 ## Decided questions
 
@@ -242,6 +297,6 @@ written down:
 | After a daemon restart, the PC stayed "controlled" | S9 |
 | Movement arriving late from the other computer counted as an edge push | S3, S6, F7 |
 | One malformed packet blocked a board's send queue for good | F3 |
-| A board stopped sending to its computer | F5 |
+| A board stopped sending to its computer | F5, P1 |
 | The Mac pointer moved along while the Mac controlled the PC | A1, B4 |
 | Two Mac daemons ran at once | D1 |

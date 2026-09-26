@@ -38,7 +38,7 @@ namespace radio_link {
 
 static const uint8_t RADIO_CHANNEL = OMNI_RADIO_CHANNEL;   // both boards must match
 static const uint32_t HEARTBEAT_INTERVAL_MS = 100;   // also the HELLO interval
-static const uint32_t LINK_TIMEOUT_MS = 3000;        // 30 missed heartbeats
+static const uint32_t LINK_TIMEOUT_MS = 1000;        // 10 missed heartbeats (T_link, requirement S7)
 static const uint32_t STATS_INTERVAL_MS = 2000;
 static const size_t RX_QUEUE_LEN = 32;
 static const size_t TX_QUEUE_LEN = 128;
@@ -49,6 +49,7 @@ static const uint32_t INPUT_ACK_TIMEOUT_MS = 25;     // a round trip normally ta
 
 static PacketHandler inputHandler = nullptr;
 static PacketHandler relayHandler = nullptr;
+static PacketHandler hostGoneHandler = nullptr;
 
 // Input packets waiting to go out, in order.
 struct Outgoing {
@@ -229,14 +230,20 @@ static bool serviceAwaitingAck() {
     }
     uint32_t seq;
     esp_err_t result = transmit(peerMac, awaiting.packet, &seq);
-    if (result == ESP_OK) {
-        awaiting.seqs[awaiting.attempts++] = seq;
-        awaiting.sentMs = millis();
-        stats.inputSent++;
-        total.inputSent++;
-        total.inputRetransmits++;
+    if (result == ESP_ERR_ESPNOW_NO_MEM) return true;   // ESP-NOW is busy; try again next pass
+    if (result != ESP_OK) {
+        // It can't be sent at all: give up instead of retrying forever,
+        // which would hold up everything queued behind it.
+        awaiting.active = false;
+        total.inputGaveUp++;
+        return false;
     }
-    return true;    // on ESP_ERR_ESPNOW_NO_MEM, try again next pass
+    awaiting.seqs[awaiting.attempts++] = seq;
+    awaiting.sentMs = millis();
+    stats.inputSent++;
+    total.inputSent++;
+    total.inputRetransmits++;
+    return true;
 }
 
 // Sends the next queued input packet, unless an earlier one is still
@@ -260,6 +267,8 @@ static void flushTxQueue() {
             awaiting.seqs[0] = seq;
             awaiting.sentMs = millis();
         }
+    } else {
+        total.inputGaveUp++;    // can't be sent at all: dropped
     }
     txHead = (txHead + 1) % TX_QUEUE_LEN;
     txCount--;
@@ -337,10 +346,11 @@ static void handle(Received &r) {
     lastHeardMs = millis();
 
     bool isInput = proto::isInputMessage(header.msg_type);
-    if (isInput || proto::isRelayMessage(header.msg_type)) {
+    bool isHostGone = header.msg_type == proto::MSG_HOST_GONE;
+    if (isInput || isHostGone || proto::isRelayMessage(header.msg_type)) {
         stats.inputReceived++;
         total.inputReceived++;
-        PacketHandler handler = isInput ? inputHandler : relayHandler;
+        PacketHandler handler = isInput ? inputHandler : isHostGone ? hostGoneHandler : relayHandler;
         if (handler) handler(r.data);
         // Acknowledge after processing, so "acknowledged" means "applied"
         // (for a relayed message: handed to the host). A retransmitted
@@ -411,9 +421,10 @@ static void printStats() {
     stats = Stats();
 }
 
-void begin(PacketHandler onInput, PacketHandler onRelay) {
+void begin(PacketHandler onInput, PacketHandler onRelay, PacketHandler onHostGone) {
     inputHandler = onInput;
     relayHandler = onRelay;
+    hostGoneHandler = onHostGone;
     rxQueue = xQueueCreate(RX_QUEUE_LEN, sizeof(Received));
 
     // ESP-NOW needs the Wi-Fi radio running in station mode, but we never
@@ -568,7 +579,8 @@ bool isLinkUp() {
 // the next one moves it anyway. But a movement that changes the buttons
 // is, or a click or drag could get stuck. Repeats are harmless, because
 // the peer applies them as state ("key A is down"), not as toggles.
-// Relayed daemon messages (a handoff) are rare and must arrive too.
+// Relayed daemon messages (a view) and MSG_HOST_GONE are rare and must
+// arrive too. MSG_KEY_STATE is not: another follows a second later.
 static bool needsAck(const uint8_t *packet) {
     uint8_t msgType = packet[offsetof(proto::Header, msg_type)];
     if (proto::isRelayMessage(msgType)) return true;
@@ -576,6 +588,7 @@ static bool needsAck(const uint8_t *packet) {
         case proto::MSG_KEY_DOWN:
         case proto::MSG_KEY_UP:
         case proto::MSG_MODIFIER_SYNC:
+        case proto::MSG_HOST_GONE:
             return true;
         case proto::MSG_MOUSE_MOVE: {
             uint8_t buttons = packet[proto::HEADER_SIZE + offsetof(proto::MouseMove, buttons)];
@@ -590,6 +603,7 @@ static bool needsAck(const uint8_t *packet) {
 
 bool sendToPeer(const uint8_t *packet) {
     if (!isLinkUp() || txCount == TX_QUEUE_LEN) return false;
+    if (!proto::fitsSealedData(packet)) return false;   // could never be sealed
     Outgoing &slot = txQueue[(txHead + txCount) % TX_QUEUE_LEN];
     memcpy(slot.packet, packet, proto::PACKET_SIZE);
     slot.needsAck = needsAck(packet);

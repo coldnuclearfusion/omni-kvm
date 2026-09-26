@@ -1,5 +1,5 @@
-//! macOS pointer handling for handoffs: puts the pointer where the other
-//! computer hands it over, and watches whether it touches a screen edge.
+//! macOS pointer handling: where the pointer enters after an edge switch,
+//! and keeping it still and hidden while the Mac is unfocused.
 //!
 //! Uses a few CoreGraphics functions directly. Coordinates are in points,
 //! with the origin at the top-left corner of the main display and y
@@ -7,22 +7,26 @@
 //!
 //! Neither reading nor moving the pointer needs a macOS permission.
 
-use std::ffi::c_void;
-use std::sync::mpsc::Sender;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::ffi::{c_char, c_void};
+use std::ptr::null;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Once, OnceLock};
+use std::thread;
 
-use crate::input::Event;
-use crate::peer::{self, PeerMsg};
+use crate::focus::Pointer;
+use crate::protocol;
 
-/// How often the pointer position is checked.
-const WATCH_INTERVAL: Duration = Duration::from_millis(10);
-/// Edge contact is re-sent at least this often, which also tells the
-/// other daemon this one is running.
-const KEEPALIVE: Duration = Duration::from_secs(1);
-/// A handed-over pointer appears this far inside the edge, so it is not
+/// An entering pointer appears this far inside the edge, so it is not
 /// pushing against the edge the moment it arrives.
 const ENTRY_INSET: f64 = 20.0;
+/// While hidden, the pointer waits at least this far from every edge of
+/// the desktop, where it could reveal a hidden Dock or set off a hot
+/// corner. It still moves a little with every movement before it is put
+/// back.
+const PARK_MARGIN: f64 = 50.0;
+/// kCGEventSourceStateCombinedSessionState: the state of this login session.
+const COMBINED_SESSION_STATE: i32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -50,19 +54,30 @@ unsafe extern "C" {
     fn CGEventCreate(source: *const c_void) -> *mut c_void;
     fn CGEventGetLocation(event: *const c_void) -> CGPoint;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
-    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+    fn CGEventSourceCreate(state: i32) -> *mut c_void;
+    fn CGEventSourceSetLocalEventsSuppressionInterval(source: *mut c_void, seconds: f64);
     fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(object: *const c_void);
+    fn CFStringCreateWithCString(allocator: *const c_void, string: *const c_char, encoding: u32) -> *const c_void;
+    static kCFBooleanTrue: *const c_void;
+}
+
+// libSystem, which every macOS program links.
+unsafe extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
 /// The rectangle enclosing every display: (left, top, right, bottom),
 /// with right and bottom being the last point inside.
-fn desktop() -> Option<(f64, f64, f64, f64)> {
+pub fn desktop() -> Option<(f64, f64, f64, f64)> {
     let mut ids = [0u32; 16];
     let mut count = 0u32;
     if unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) } != 0 || count == 0 {
@@ -79,78 +94,172 @@ fn desktop() -> Option<(f64, f64, f64, f64)> {
     Some((left, top, right, bottom))
 }
 
-fn pointer() -> Option<CGPoint> {
+fn pointer_location() -> Option<(f64, f64)> {
     unsafe {
-        let event = CGEventCreate(std::ptr::null());
+        let event = CGEventCreate(null());
         if event.is_null() {
             return None;
         }
         let p = CGEventGetLocation(event);
         CFRelease(event);
-        Some(p)
+        Some((p.x, p.y))
     }
 }
 
-/// Which edges the pointer touches, and where it is along the left/right
-/// edges. (With several displays side by side, only the outer edges of the
-/// whole arrangement count.)
-fn contact() -> Option<(u8, u16)> {
-    let (left, top, right, bottom) = desktop()?;
-    let p = pointer()?;
-    let mut edges = 0;
-    if p.x <= left {
-        edges |= peer::CONTACT_LEFT;
-    }
-    if p.x >= right {
-        edges |= peer::CONTACT_RIGHT;
-    }
-    if p.y <= top {
-        edges |= peer::CONTACT_TOP;
-    }
-    if p.y >= bottom {
-        edges |= peer::CONTACT_BOTTOM;
-    }
-    Some((edges, peer::fraction(p.y, top, bottom)))
+/// Where a Quartz event happened: for mouse events, the pointer position.
+pub fn event_location(event: *const c_void) -> (f64, f64) {
+    let p = unsafe { CGEventGetLocation(event) };
+    (p.x, p.y)
 }
 
-/// Puts the pointer where a handoff says it enters this screen: it left
-/// the other screen by `edge`, so it comes in by the opposite one.
-pub fn enter(edge: u8, position: u16) -> bool {
-    let Some((left, top, right, bottom)) = desktop() else { return false };
-    let x = match edge {
-        peer::EDGE_RIGHT => left + ENTRY_INSET,
-        peer::EDGE_LEFT => right - ENTRY_INSET,
-        _ => return false,
-    };
-    let y = peer::from_fraction(position, top, bottom);
+/// Moves the pointer, without the pause macOS normally adds after a warp.
+fn warp((x, y): (f64, f64)) {
     unsafe {
-        if CGWarpMouseCursorPosition(CGPoint { x, y }) != 0 {
-            return false;
+        // After a warp, macOS ignores the mouse for a moment: measured 250–
+        // 258 ms of a frozen pointer right after entering the Mac, which
+        // felt like extra resistance on the way in. Setting the suppression
+        // interval to 0 on an event source for this session lifts it
+        // (measured: the pointer moves within 6 ms). The older global
+        // CGSetLocalEventsSuppressionInterval also works but is deprecated;
+        // CGAssociateMouseAndMouseCursorPosition had no effect.
+        let source = CGEventSourceCreate(COMBINED_SESSION_STATE);
+        if !source.is_null() {
+            CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0);
+            CFRelease(source);
         }
-        // After a warp, macOS ignores mouse movement for a moment (~0.25 s)
-        // unless told otherwise; the pointer should keep moving at once.
-        CGAssociateMouseAndMouseCursorPosition(1);
+        CGWarpMouseCursorPosition(CGPoint { x, y });
     }
-    true
 }
 
-/// Reports edge contact to the other daemon whenever it changes (and every
-/// second), until the board thread is gone. Runs on the calling thread.
-pub fn watch_edges(tx: Sender<Event>) {
-    let mut last: Option<(u8, u16)> = None;
-    let mut last_sent = Instant::now();
-    loop {
-        if let Some((edges, position)) = contact() {
-            // Along an edge the position matters; away from all edges it doesn't.
-            let changed = last.is_none_or(|(e, p)| e != edges || (edges != 0 && p != position));
-            if changed || last_sent.elapsed() >= KEEPALIVE {
-                if tx.send(Event::Peer(PeerMsg::EdgeContact { edges, position })).is_err() {
-                    return;
+// While the Mac is unfocused, its pointer is frozen: hidden, and put back
+// after every movement, since the Mac's own mouse keeps moving it
+// (swallowing the events does not stop that, and
+// CGAssociateMouseAndMouseCursorPosition, the usual way to freeze it, only
+// works for the frontmost app). It waits away from the screen edges and is
+// shown again where it stopped (B4).
+//
+// The work happens on a worker thread: moving or hiding the pointer means
+// asking the window server, which may be waiting for the event tap's
+// callback to return. Done inside the callback, that can stall until
+// macOS gives up on the tap and passes input straight to the Mac (D3).
+
+static FROZEN: AtomicBool = AtomicBool::new(false);
+
+enum Job {
+    Freeze,
+    PutBack,
+    Resume,
+    Enter(u16),
+}
+
+fn later(job: Job) {
+    static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
+    let jobs = JOBS.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut stopped_at = (0.0, 0.0);
+            let mut wait_at = (0.0, 0.0);
+            let mut hidden = false;
+            for job in rx {
+                match job {
+                    Job::Freeze => {
+                        stopped_at = pointer_location().unwrap_or(stopped_at);
+                        wait_at = away_from_edges(stopped_at);
+                        FROZEN.store(true, Ordering::Relaxed);
+                        warp(wait_at);
+                        show_pointer(false, &mut hidden);
+                    }
+                    // Skip put-backs queued before the pointer was let go.
+                    Job::PutBack if FROZEN.load(Ordering::Relaxed) => warp(wait_at),
+                    Job::PutBack => {}
+                    Job::Resume => {
+                        if FROZEN.swap(false, Ordering::Relaxed) {
+                            warp(stopped_at);
+                        }
+                        show_pointer(true, &mut hidden);
+                    }
+                    Job::Enter(height) => {
+                        FROZEN.store(false, Ordering::Relaxed);
+                        if let Some((left, top, _, bottom)) = desktop() {
+                            // Just inside the Mac's facing (left) edge, at the
+                            // same fraction of the height as where it left the PC.
+                            warp((left + ENTRY_INSET, protocol::from_fraction(height, top, bottom)));
+                        }
+                        show_pointer(true, &mut hidden);
+                    }
                 }
-                last = Some((edges, position));
-                last_sent = Instant::now();
             }
+        });
+        tx
+    });
+    let _ = jobs.send(job);
+}
+
+fn away_from_edges((x, y): (f64, f64)) -> (f64, f64) {
+    let Some((left, top, right, bottom)) = desktop() else { return (x, y) };
+    let inside = |v: f64, low: f64, high: f64| {
+        if high - low < 2.0 * PARK_MARGIN { (low + high) / 2.0 } else { v.clamp(low + PARK_MARGIN, high - PARK_MARGIN) }
+    };
+    (inside(x, left, right), inside(y, top, bottom))
+}
+
+/// Carries out a pointer action of the focus state machine.
+pub fn pointer(action: Pointer) {
+    match action {
+        Pointer::Freeze => later(Job::Freeze),
+        Pointer::Resume => later(Job::Resume),
+        Pointer::Enter(entry) => later(Job::Enter(entry.height)),
+    }
+}
+
+/// The pointer moved while it should stay still: put it back.
+pub fn put_back() {
+    if FROZEN.load(Ordering::Relaxed) {
+        later(Job::PutBack);
+    }
+}
+
+/// Hides or shows the pointer, keeping the calls balanced: macOS counts them.
+fn show_pointer(visible: bool, hidden: &mut bool) {
+    static ALLOW_IN_BACKGROUND: Once = Once::new();
+    if visible != *hidden {
+        return; // already so
+    }
+    ALLOW_IN_BACKGROUND.call_once(allow_hiding_in_background);
+    unsafe {
+        if visible {
+            CGDisplayShowCursor(CGMainDisplayID());
+        } else {
+            CGDisplayHideCursor(CGMainDisplayID());
         }
-        sleep(WATCH_INTERVAL);
+    }
+    *hidden = !visible;
+}
+
+/// macOS lets only the frontmost app hide the pointer. The window server
+/// setting "SetsCursorInBackground" lifts that for this program; it is
+/// undocumented (Synergy and Deskflow rely on it), so it is looked up at
+/// run time: if a macOS release drops it, the pointer just stays visible.
+fn allow_hiding_in_background() {
+    type DefaultConnection = unsafe extern "C" fn() -> i32;
+    type SetConnectionProperty = unsafe extern "C" fn(i32, i32, *const c_void, *const c_void) -> i32;
+    const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+    const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
+    unsafe {
+        let default_connection = dlsym(RTLD_DEFAULT, c"_CGSDefaultConnection".as_ptr());
+        let set_property = dlsym(RTLD_DEFAULT, c"CGSSetConnectionProperty".as_ptr());
+        if default_connection.is_null() || set_property.is_null() {
+            say!("[input] this macOS cannot hide the pointer from the background; it stays visible");
+            return;
+        }
+        let default_connection: DefaultConnection = std::mem::transmute(default_connection);
+        let set_property: SetConnectionProperty = std::mem::transmute(set_property);
+        let key = CFStringCreateWithCString(null(), c"SetsCursorInBackground".as_ptr(), UTF8);
+        if key.is_null() {
+            return;
+        }
+        let connection = default_connection();
+        set_property(connection, connection, key, kCFBooleanTrue);
+        CFRelease(key);
     }
 }

@@ -46,11 +46,23 @@ pub struct Board {
 
 impl Board {
     pub fn open(port_name: &str) -> serialport::Result<Board> {
+        // Reads never wait (see `receive`), so this only bounds writes. It
+        // is generous: a write given up halfway leaves the board holding
+        // part of a packet.
         let mut port = serialport::new(port_name, 115_200)
-            .timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(500))
             .open()?;
-        // The board only sends to us once the host signals it is listening
-        // (DTR). Its firmware ignores DTR/RTS otherwise, so this is safe.
+        // The board counts a daemon as connected while DTR and RTS are both
+        // on: only then does it send to us and keep its input gate as we
+        // say. When this process ends, the operating system closes the port,
+        // and the board opens its gate and tells the other board (see
+        // "Input gate" in shared/protocol.md). The board's firmware does
+        // not reboot on DTR/RTS changes on this port.
+        //
+        // RTS first: on Windows, the board sees both on only when DTR is
+        // raised while RTS already is; raising RTS second leaves it silent
+        // (docs/platform.md, measured 2026-09-26).
+        port.write_request_to_send(true)?;
         port.write_data_terminal_ready(true)?;
         Ok(Board { port, seq: 0, received: Vec::new() })
     }
@@ -110,7 +122,7 @@ mod tests {
     #[test]
     fn assembles_packets_from_a_byte_stream() {
         let a = packet(msg::DAEMON_STATUS, 1, &[3]);
-        let b = packet(msg::HANDOFF, 2, &[1, 7, 0, 0x80]);
+        let b = packet(msg::VIEW, 2, &[1, 7, 0, 0x80]);
         let mut buf = vec![0x00, 0x13]; // noise before the first packet
         buf.extend_from_slice(&a);
         buf.extend_from_slice(&b[..10]); // b arrives in two pieces
@@ -122,7 +134,7 @@ mod tests {
 
     #[test]
     fn keeps_a_split_header() {
-        let a = packet(msg::HANDOFF_ACK, 3, &[1, 7]);
+        let a = packet(msg::VIEW, 3, &[1, 7]);
         let mut buf = vec![a[0]];
         assert!(take_packets(&mut buf).is_empty());
         assert_eq!(buf, vec![a[0]]);

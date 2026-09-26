@@ -4,10 +4,12 @@ How the two computers agree on where input goes, and what each daemon and
 board does about it. It implements [requirements.md](requirements.md);
 rule IDs (B1, S3, F6, ...) refer to that document.
 
-Status: **checked** (section 10). The state machine below is
-`daemon/src/focus.rs`; the automated check is `daemon/src/focus/check.rs`
-(`cargo test --release focus`). Next: the experiments (A1–A7), then the
-daemon and firmware changes.
+Status: **checked** (section 10) and **implemented**. The state machine
+below is `daemon/src/focus.rs`, and the daemon runs that very code through
+`daemon/src/hub.rs`; the automated check is `daemon/src/focus/check.rs`
+(`cargo test --release focus`). Firmware 0.5 implements the board side
+(section 7). Section 11 lists where the implementation goes beyond the
+model, and why that is safe.
 
 ## Overview
 
@@ -151,7 +153,9 @@ to split every 3 seconds.
   so nothing moves the pointer.
 - **Unfocused Mac:** macOS moves the pointer before any tap sees the event
   (measured), so the daemon hides it and puts it back after every
-  movement, on a worker thread (D3).
+  movement, on a worker thread (D3). While hidden it waits at least 50 pt
+  from the screen edges, where it could otherwise reveal a hidden Dock or
+  set off a hot corner, and it is shown again exactly where it stopped.
 
 ## 5. Keys and buttons (B5, D7)
 
@@ -178,12 +182,18 @@ to split every 3 seconds.
   here; focus here, or split → the other computer. This works whatever
   state the other daemon is in, including not running (B8).
 - **Default (H4):** the completing key (Escape, Scroll Lock) goes
-  nowhere. GUI went out before Escape (to this computer if it was
-  focused, to the other one if not) and is released at once: by this
-  daemon on its own computer, by the other board when its gate closes.
-  Windows opens the Start menu on a lone Windows-key tap; if A7 shows it
-  does here, a harmless dummy key is tapped before the release (the
-  board can do that itself whenever it releases a held GUI key).
+  nowhere, its repeats and release included. GUI went out before Escape
+  (to this computer if it was focused, to the other one if not); its
+  release goes where its press went (D7), and if that was the other
+  computer, that computer's board also lets go of it when its gate
+  closes.
+- **Start menu.** Windows opens it when a Windows key goes up with no
+  other key since it went down, so two things make sure there is one:
+  a board that lets go of a held GUI key on its own (gate closing, link
+  loss, `KEY_STATE`, `HOST_GONE`) presses Ctrl first; and the Windows
+  daemon, whenever it keeps a key press from Windows while Windows holds a
+  Windows key (the hotkey's Escape, input it drops or forwards, that Ctrl
+  included), taps the unassigned virtual key 0xE8 for Windows alone.
 - **With H6 on**, the completing key is delivered too. The other daemon
   may then see the whole hotkey arrive through its board and decide as
   well. Both decisions name the same computer (one side says "here", the
@@ -312,6 +322,24 @@ A user action is a key press, a movement or a hotkey; key releases,
 restarts and reconnections come on top, free. A fault is a lost or
 doubled radio message, a link loss, a daemon crash, an unplugged board,
 or a daemon wrongly taken for silent.
+
+## 11. From model to implementation
+
+The daemon runs the checked state machine itself; around it, the
+implementation has to deal with things the model leaves out. Each is
+listed with why it keeps the checked rules.
+
+| Implementation detail | Why the rules still hold |
+|---|---|
+| The machine is shared by the input thread and the board thread; what it decides, and each input packet to forward, goes into one queue, filled only while the machine is locked (`hub.rs`). | The board receives commands and forwarded input in the order the machine decided them, as in the model, where commands take effect at once. The lock is held for microseconds, never across a wait (D3). |
+| The board confirms a gate close only once the releases it caused have reached the computer (or after 50 ms if USB takes no reports). | At the confirmation the releases are in the operating system's queue, as the model has them; the settle time then covers the capture. In the 50 ms case, a Ctrl press added for a held Windows key could reach the capture after the settle time and be forwarded: a stray Ctrl tap on the other computer, nothing worse. |
+| Auto-repeat: a repeat goes where its key's press went and changes nothing (`route_held`). | The model has no repeats; routing them like the press they belong to keeps D7 and S4. |
+| Windows reads movement twice: the hooks decide what Windows sees, Raw Input gives the unaccelerated counts. Raw Input forwards movement only while the hooks' latest decision is also "forward". | Movement Windows was given is never also forwarded (S4) unless the input thread stalls for more than the settle time between the two. |
+| Windows: a key-down more than 1.5 s after the key's previous event is a new press whose release never reached the hook (the lock screen took it); the missed release is routed first. | The pressed map stays true to the keys actually held (D7, B5). |
+| Start-menu guard (section 6). | Only Windows sees the tapped key 0xE8; the board's Ctrl press is released with the rest and is dropped by a closing daemon like any board input. |
+| macOS: input passed to the Mac gets the modifiers passed to it from every keyboard added to its flags (A2). A release on any keyboard clears that modifier. | Nothing is forwarded or held because of it; a modifier cannot get stuck, at worst one is not added while two keyboards hold it. |
+| The "other daemon silent" timer restarts with every board connection. | A daemon heard before must answer again within 3 s (S8); one never heard is still never taken for silent (B8). |
+| A gate close not confirmed in 100 ms makes the daemon drop its board connection and reconnect. | The machine has already fallen back to split mode for the missing board; the reconnection is the model's unplug and replug. |
 
 ## Found by the automated check
 

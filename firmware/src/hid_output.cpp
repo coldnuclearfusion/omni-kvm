@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
+#include "usb_guard.h"
 
 namespace hid_output {
 
@@ -30,6 +31,7 @@ static bool keyboardStalled = false;
 // change queues a full snapshot of it; update() sends the snapshots one
 // gap apart.
 static KeyReport keyState = {};
+static KeyReport lastSent = {};     // what the host last received
 static KeyReport keyQueue[KEY_QUEUE_LEN];
 static size_t queueHead = 0;
 static size_t queueCount = 0;
@@ -98,8 +100,14 @@ void syncModifiers(uint8_t modifiers) {
 // Mouse reports are not queued: a late movement is worse than a lost one
 // (it makes the pointer jump), so they are dropped, and counted, when the
 // interface isn't ready.
+// Ready for a report: the interface is, and the USB FIFOs are laid out
+// safely (usb_guard.h).
+static bool usbReady() {
+    return hidInterface.ready() && usb_guard::fifosReady();
+}
+
 void mouseMove(int16_t dx, int16_t dy, uint8_t buttons) {
-    if (!hidInterface.ready()) {
+    if (!usbReady()) {
         counters.mouseDropped++;
         return;
     }
@@ -120,7 +128,7 @@ void mouseMove(int16_t dx, int16_t dy, uint8_t buttons) {
 }
 
 void mouseScroll(int16_t vertical, int16_t horizontal) {
-    if (!hidInterface.ready()) {
+    if (!usbReady()) {
         counters.mouseDropped++;
         return;
     }
@@ -133,14 +141,53 @@ void mouseScroll(int16_t vertical, int16_t horizontal) {
     }
 }
 
-void releaseAll() {
-    bool held = keyState.modifiers != 0;
-    for (uint8_t k : keyState.keys) held = held || k != 0;
-    if (held) {
-        keyState = {};
+// ── Letting go without being told ─────────────────────────
+// Windows opens the Start menu when a Windows key goes down and up with
+// no other key in between. When the board lets go of one on its own, a
+// Ctrl press goes first so that Windows does not take it for such a tap.
+static const uint8_t LEFT_CTRL = 0x01;
+static const uint8_t RIGHT_CTRL = 0x10;
+static const uint8_t GUI_MODIFIERS = 0x08 | 0x80;   // left and right
+
+// Lets go of keys until the state is `target`, which holds nothing that
+// keyState does not.
+static void letGoTo(const KeyReport &target) {
+    if (memcmp(&target, &keyState, sizeof(target)) == 0) return;
+    uint8_t freeCtrl = ~keyState.modifiers & (LEFT_CTRL | RIGHT_CTRL);
+    if ((keyState.modifiers & ~target.modifiers & GUI_MODIFIERS) && freeCtrl) {
+        keyState.modifiers |= (freeCtrl & LEFT_CTRL) ? LEFT_CTRL : RIGHT_CTRL;
         queueKeyState();
     }
+    keyState = target;
+    queueKeyState();
+}
+
+void releaseAll() {
+    letGoTo(KeyReport{});
     if (mouseButtons != 0) mouseMove(0, 0, 0);
+}
+
+void dropPending() {
+    queueCount = 0;
+    keyState = lastSent;
+}
+
+void hostLostState() {
+    lastSent = KeyReport{};
+    if (queueCount == 0 && memcmp(&keyState, &lastSent, sizeof(keyState)) != 0) queueKeyState();
+}
+
+void keepOnly(uint8_t modifiers, uint8_t buttons, const uint8_t keys[6]) {
+    KeyReport target = keyState;
+    target.modifiers &= modifiers;
+    for (uint8_t &k : target.keys) {
+        bool listed = false;
+        for (int i = 0; i < 6; i++) listed = listed || keys[i] == k;
+        if (!listed) k = 0;
+    }
+    letGoTo(target);
+    uint8_t keep = mouseButtons & buttons;
+    if (keep != mouseButtons) mouseMove(0, 0, keep);
 }
 
 // ── Setup and pacing ──────────────────────────────────────
@@ -155,7 +202,7 @@ void update() {
 
     // Not ready: keep the report and try again on the next pass, so a
     // keystroke is delayed rather than lost.
-    if (!hidInterface.ready()) {
+    if (!usbReady()) {
         if (!keyboardStalled) counters.keyboardStalls++;
         keyboardStalled = true;
         return;
@@ -163,9 +210,14 @@ void update() {
     keyboardStalled = false;
 
     Keyboard.sendReport(&keyQueue[queueHead]);
+    lastSent = keyQueue[queueHead];
     queueHead = (queueHead + 1) % KEY_QUEUE_LEN;
     queueCount--;
     lastKeyReportMs = millis();
+}
+
+bool allSent() {
+    return queueCount == 0;
 }
 
 Stats stats() {

@@ -57,14 +57,18 @@ Value  Name                  Direction       Description
 0x04   MSG_KEY_UP            source → sink   Key release
 0x05   MSG_MODIFIER_SYNC     source → sink   Full modifier state snapshot
 0x06   MSG_INPUT_ACK         sink → source   "Input packet <seq> processed"
+0x07   MSG_KEY_STATE         source → sink   Keys and buttons still held (repairs lost releases)
 
-0x10   MSG_HANDOFF           either → either Cursor control transfer request
-0x11   MSG_HANDOFF_ACK       either → either Confirms handoff accepted
-0x12   MSG_EDGE_CONTACT      sink → source   Which screen edges the pointer touches
+0x10   MSG_VIEW              daemon ↔ daemon Where the focus is (see docs/focus-design.md)
+0x11   (retired)                             was MSG_HANDOFF_ACK
+0x12   (retired)                             was MSG_EDGE_CONTACT
+0x1E   MSG_BOARD_REPORT      board → host    Development: a board's diagnostic report, passed on
+                                             by the other board to its host
 
 0x20   MSG_HEARTBEAT         both ↔ both     Keepalive ping
 0x21   MSG_HEARTBEAT_ACK     both ↔ both     Keepalive pong
 0x22   MSG_SESSION_HELLO     both ↔ both     Session handshake (see Sessions)
+0x23   MSG_HOST_GONE         board → board   This board's daemon disconnected
 
 0x30   MSG_PAIR_REQUEST      either → either Initiate pairing
 0x31   MSG_PAIR_CHALLENGE    either → either Pairing challenge (crypto)
@@ -83,16 +87,16 @@ Value  Name                  Direction       Description
 0xFF   MSG_DFU_ENTER         daemon → fw     Enter firmware update mode
 ```
 
-"source" = currently active side, "sink" = currently passive side. For symmetric messages (heartbeat, pairing), either side can send.
+"source" = the computer whose daemon forwards its own input (the unfocused one), "sink" = the computer that has the focus (see `docs/focus-design.md`). For symmetric messages (heartbeat, pairing), either side can send.
 
 ### Relayed daemon-to-daemon messages
 
-Types **0x10–0x1F** (handoff) and **0x50–0x5F** (lock) are conversations between the two daemons. A board takes them from its host over USB, sends them to the peer board like acknowledged input (see [Sequencing and reliability](#sequencing-and-reliability)), and the peer board writes them unchanged to its own host's USB serial port. The firmware never reads their payload, so the daemons can add message types in these ranges without a firmware update.
+Types **0x10–0x1F** (focus: `MSG_VIEW`) and **0x50–0x5F** (lock) are conversations between the two daemons. A board takes them from its host over USB, sends them to the peer board like acknowledged input (see [Sequencing and reliability](#sequencing-and-reliability)), and the peer board writes them unchanged to its own host's USB serial port. The firmware never reads their payload, so the daemons can add message types in these ranges without a firmware update.
 
 - **Size**: only the first 28 bytes after the header cross the radio; the rest arrives as zeros.
 - **Header on arrival**: `seq` is the sending board's radio sequence number, and `flags` may still have `ACK_REQUESTED` set. Daemons ignore both.
 - **Duplicates**: if a board's acknowledgement is lost, the message is resent and reaches the peer daemon twice. Daemons must treat a repeat as harmless.
-- **No daemon listening**: if the peer's USB serial port is closed, or its buffer is full, the peer board drops the message (and logs it on its UART port). A daemon that needs an answer waits for one (e.g. `MSG_HANDOFF_ACK`) and decides what to do without it.
+- **No daemon listening**: if the peer's USB serial port is closed, or its buffer is full, the peer board drops the message (and logs it on its UART port). Daemons repeat their view every second, so a lost one is repaired.
 
 Measured round trip, Windows daemon → Mac daemon → Windows daemon through both boards: 4.0 ms.
 
@@ -156,7 +160,7 @@ Offset  Size  Field       Description
 9       55    (padding)   Zero-filled
 ```
 
-Sent periodically (every ~500 ms) and on every handoff to prevent stuck modifiers. Also sent when the link recovers from disconnection.
+Sets the modifier state as a whole. Periodic repair of held keys and buttons is `MSG_KEY_STATE`.
 
 ### MSG_INPUT_ACK (0x06)
 
@@ -169,57 +173,39 @@ Offset  Size  Field       Description
 
 Sent by the receiving board after it has **processed** an input packet that carried `ACK_REQUESTED`. See [Sequencing and reliability](#sequencing-and-reliability).
 
-### MSG_HANDOFF (0x10)
-
-"The pointer is now on your screen." Sent by the daemon whose keyboard and mouse are in use, when the pointer crosses to the other screen.
+### MSG_KEY_STATE (0x07)
 
 ```
 Offset  Size  Field       Description
 ──────  ────  ──────────  ────────────────────────────────────────
-8       1     edge        Which edge of the sender's screen the pointer left by:
-                          0x01=right, 0x02=left, 0x03=top, 0x04=bottom
-9       1     id          Handoff counter (wraps), so a repeat can be recognized
-10      2     position    Where along that edge, as a fraction (uint16):
-                          0 = top (or left end), 65535 = bottom (or right end)
-12      52    (padding)   Zero-filled
+8       1     modifiers   Modifiers still held whose press was forwarded (bitfield above)
+9       1     buttons     Mouse buttons still held whose press was forwarded (as in MSG_MOUSE_MOVE)
+10      6     keys        HID usages of other keys still held whose press was forwarded (0 = none)
+16      48    (padding)   Zero-filled
 ```
 
-The receiver puts its pointer just inside the opposite edge (the Mac: 20 points in from its left edge when Windows sends 0x01), at the same fraction of its height, and answers `MSG_HANDOFF_ACK`. A repeated `id` (the handoff was retransmitted) is acknowledged again but not applied, since the pointer may have moved since.
+Sent by a daemon that forwards its input, with every keepalive (once a second). The receiving board releases every key and button it holds for the other computer that is not in the message; it never presses one. A release lost on the radio after all retries is thus repaired within a second (requirement B5). Not acknowledged: the next one follows a second later. Like other input, it passes the receiving board's [input gate](#input-gate).
 
-**Why a fraction.** The draft layout carried absolute entry coordinates computed from a negotiated monitor layout. A fraction needs no negotiation, keeps working when either side changes resolution, and lines up screens of different sizes by proportion ("40% of the way down" on both).
+### MSG_VIEW (0x10)
 
-If the receiving daemon is not running, nothing answers. The sending daemon only sends `MSG_HANDOFF` when it has heard from the other daemon in the last 3 seconds (see `MSG_EDGE_CONTACT`); otherwise it falls back to a large leftward mouse movement, which pins the other pointer to its left edge at whatever height it was.
-
-### MSG_HANDOFF_ACK (0x11)
+A daemon's view of where the focus is (`docs/focus-design.md`, section 1).
 
 ```
 Offset  Size  Field       Description
 ──────  ────  ──────────  ────────────────────────────────────────
-8       1     accepted    0x01 = accepted, 0x00 = rejected (e.g. locked,
-                          or the pointer could not be placed)
-9       1     id          The id of the MSG_HANDOFF being answered
-10      54    (padding)   Zero-filled
+8       4     epoch       Counter (uint32)
+12      1     decider     Computer that made this view: 0x01 = PC (Windows), 0x02 = Mac
+13      1     holder      Where the focus is: 0x00 = split, 0x01 = PC, 0x02 = Mac
+14      1     entry       0x01: an entry position follows (edge switch); 0x00: none
+15      2     height      Entry height as a fraction (uint16): 0 = top, 65535 = bottom
+17      47    (padding)   Zero-filled
 ```
 
-If rejected, the sending daemon reports it. (Planned: with a full-screen lock on the receiving side, the sender keeps the pointer and shows a visual indicator.)
+A daemon sends its view when it changes, when the link or its board comes back, and every second (keepalive). It adopts a received view newer than its own: higher epoch; with equal epochs the PC's decision; then the holder (PC > Mac > split). Both daemons therefore end up with the same view whatever gets lost, doubled or delayed. A daemon that has heard no view for 3 seconds treats the other daemon as stopped.
 
-### MSG_EDGE_CONTACT (0x12)
+The entry position is used only by the computer that becomes focused by adopting the view: it puts its pointer just inside its facing edge at that height.
 
-"My pointer is touching these screen edges." Sent by the daemon of the screen the pointer is on while the other computer's keyboard and mouse drive it, so the other daemon can tell when the user pushes past an edge. The pointer's position alone cannot show that: at the edge it stops moving, while the mouse keeps sending movement that only the other daemon sees.
-
-```
-Offset  Size  Field       Description
-──────  ────  ──────────  ────────────────────────────────────────
-8       1     edges       Bit 0: right, bit 1: left, bit 2: top, bit 3: bottom
-9       1     reserved    0x00
-10      2     position    Pointer height as a fraction of the screen (uint16,
-                          as in MSG_HANDOFF), meaningful while touching left/right
-12      52    (padding)   Zero-filled
-```
-
-Sent when `edges` changes, when `position` changes while touching an edge, and at least once a second. The once-a-second repeat also tells the other daemon this one is running; after 3 seconds of silence it counts as stopped.
-
-On the other side, while its input goes to this screen, the daemon adds up the mouse's movement towards a touched edge; past the same resistance as on its own screen, it takes the pointer back and places its own pointer at `position` along the facing edge. (The Mac checks its pointer every 10 ms.)
+**Why a fraction.** An earlier draft carried absolute entry coordinates computed from a negotiated monitor layout. A fraction needs no negotiation, keeps working when either side changes resolution, and lines up screens of different sizes by proportion ("40% of the way down" on both).
 
 ### MSG_HEARTBEAT (0x20) / MSG_HEARTBEAT_ACK (0x21)
 
@@ -231,7 +217,7 @@ Offset  Size  Field       Description
 13      51    (padding)   Zero-filled
 ```
 
-Heartbeat is sent by both sides every 100 ms while a session is up (before that, `MSG_SESSION_HELLO` takes its place). If 30 consecutive heartbeats are missed (3 seconds), the link is declared down and the session dropped.
+Heartbeat is sent by both sides every 100 ms while a session is up (before that, `MSG_SESSION_HELLO` takes its place). If 10 consecutive heartbeats are missed (1 second, requirement S7's T_link), the link is declared down and the session dropped. (Until firmware 0.5 this took 3 seconds.)
 
 The timestamp field allows each side to compute round-trip time. It is not a synchronized clock — each side has its own epoch. The sender puts its own clock in `timestamp`; the peer's `MSG_HEARTBEAT_ACK` echoes that value back unchanged, so RTT = (sender's clock when the ACK arrives) − `timestamp`.
 
@@ -251,6 +237,36 @@ Offset  Size  Field       Description
 
 Sealed with the long-term key, never the session key. See [Sessions](#sessions).
 
+### MSG_HOST_GONE (0x23)
+
+No payload. A board sends it when its own computer's daemon disconnects (the USB serial port closes: the daemon quit or crashed). The receiving board releases every key and button it holds for the other computer (requirement F8), since the daemon that pressed them can no longer release them. Sent like acknowledged input (retried until acknowledged); board-to-board only, never passed to a daemon.
+
+### MSG_BOARD_REPORT (0x1E)
+
+Development only, while switched on with `MSG_DAEMON_CMD` 0x0A. A board sends it to the other board every 500 ms, which passes it to its host like a relayed daemon message; it therefore gets through even when the sending board can no longer send to its own host. The same fields are printed on the sending board's UART log.
+
+```
+Offset  Size  Field          Description
+──────  ────  ─────────────  ─────────────────────────────────────────
+8       1     format         1
+9       1     usb_flags      Bit 0 configured, 1 suspended, 2 ready, 3 DTR on,
+                             4 "prevent" on, 5 FIFO layout fixed, 6 serial IN busy
+10      2     fifo_empty_msk USB core DIEPEMPMSK
+12      4     ep_ctl         Serial IN endpoint (EP4) DIEPCTL
+16      4     ep_size        ... DIEPTSIZ (bits 0–18 bytes left, 19–28 packets left)
+20      2     ep_int         ... DIEPINT
+22      1     ep_fifo_free   ... DTXFSTS: words free in its FIFO (saturates at 255)
+23      1     link_flags     Bit 0 daemon connected, 1 radio link up
+24      2     queued         Bytes waiting for the host
+26      4     sent           Bytes taken by the USB driver since boot
+30      2     waiting_ms     Since the driver last took any (saturates)
+32      2     layout_fixes   Times the FIFO layout was fixed (see below)
+34      2     reconnects     Times the USB watchdog reconnected the device
+36      28    (padding)      Zero-filled
+```
+
+**Why it exists.** Under load, a board's serial link to its host stopped for good (requirement F5, experiment A5). These reports showed the serial IN endpoint holding a packet it never sent, and a dump of the USB core's registers showed why: the Arduino core's USB driver (TinyUSB 0.16, `dcd_esp32sx.c`) configures the transmit FIFO whose number is the endpoint's instead of the endpoint's own, so the FIFOs in use keep hardware defaults outside the core's 200-word FIFO memory and overlap the receive FIFO. The firmware now lays the FIFOs out itself after each configuration (`firmware/include/usb_guard.h`).
+
 ### MSG_LOCK (0x50) / MSG_UNLOCK (0x51)
 
 ```
@@ -260,7 +276,7 @@ Offset  Size  Field       Description
 9       55    (padding)   Zero-filled
 ```
 
-When a side is locked, incoming handoff requests are rejected with `MSG_HANDOFF_ACK(accepted=0x00)`.
+Not implemented yet. The intent: while a side is locked (a full-screen game, say), a push past its edge does not move the focus away. How this fits the focus design (`docs/focus-design.md`) is to be worked out, and checked, when the feature is built.
 
 ### MSG_DAEMON_CMD (0x40)
 
@@ -276,6 +292,23 @@ Offset  Size  Field       Description
                           0x06 = (retired: set radio TX window)
                           0x07 = development: set radio TX rate
                                  (data[0] = ESP-IDF wifi_phy_rate_t, e.g. 0x0A = 12 Mbps)
+                          0x08 = open the input gate
+                          0x09 = close the input gate (data[0] = request number)
+                                 → MSG_DAEMON_STATUS 0x06 with the same number
+                          0x0A = development: USB guard (data[0] = setting,
+                                 data[1] = 1 on / 0 off): 1 = write to the host
+                                 only when the serial endpoint has been idle
+                                 for 1 ms (default on); 3 = MSG_BOARD_REPORT
+                                 every 500 ms (default off); 4 = print the USB
+                                 FIFO layout on the UART log (data[1] unused);
+                                 7 = send the host a filler status (0x7F) every
+                                 2 ms, for USB tests with one board (default off);
+                                 8 = disconnect from USB and connect again, as
+                                 the USB watchdog does (data[1] unused);
+                                 9 = once a serial transfer is under way, do
+                                 what the USB driver's own reset does (the
+                                 device forgets its address; the computer
+                                 resets it) (data[1] unused)
 9       55    (data)      Sub-command-specific data
 ```
 
@@ -293,7 +326,13 @@ Offset  Size  Field       Description
                           0x02 = firmware version (semver string, max 16 bytes)
                           0x03 = link statistics (layout below)
                           0x04 = pairing state change
-                          0x05 = link up / link down event
+                          0x05 = link up / link down (data[0] = 1 / 0), sent
+                                 when a daemon connects and whenever the link
+                                 changes; a new session with no gap in between
+                                 (the other board restarted) is sent as down,
+                                 then up
+                          0x06 = input gate closed (data[0] = the request number
+                                 it answers)
 9       55    (data)      Sub-status-specific data
 ```
 
@@ -325,6 +364,16 @@ Offset  Size  Field               Description
 ```
 
 Readers must check `layout` and refuse unknown values rather than misread the counters.
+
+### Input gate
+
+A board types the other computer's input (`MSG_MOUSE_MOVE` to `MSG_MODIFIER_SYNC`, and `MSG_KEY_STATE`) into its own computer only while its **input gate** is open. A daemon closes its board's gate before it starts forwarding its own input, and opens it after it stops, so input can never circle between the two computers (`docs/focus-design.md`, requirement S3).
+
+- **No daemon connected**: the gate is open, so a computer without a daemon still works as a plain USB keyboard and mouse for the other side (requirement B8). A daemon counts as connected while it holds the board's USB serial port open with DTR and RTS on; the operating system closes the port when the daemon quits or crashes, and the board then sends `MSG_HOST_GONE`.
+- **Closing** (command 0x09): the board drops keyboard reports not sent yet, releases every key and button it holds for the other computer, and once those releases have reached the computer, answers with status 0x06 and the command's request number. The daemon's settle time starts from that answer, so it only has to cover the computer's own handling of input already delivered. (If USB takes no reports for 50 ms, the board answers anyway rather than hold up the switch.) Only the answer with the latest number counts; an earlier one can arrive late.
+- **Releasing a held Windows/Command key** without being told to (on closing, link loss, `MSG_KEY_STATE` or `MSG_HOST_GONE`): a Ctrl press is added first, and released with the rest, so that Windows does not see a lone Windows-key tap and open the Start menu. A daemon whose capture drops that Ctrl press (it does, while closing) must then do the same itself before the Windows key's release reaches Windows.
+
+Input stopped at a closed gate is still acknowledged (`MSG_INPUT_ACK`): it was handled, by dropping it.
 
 ## Encryption
 
@@ -415,7 +464,7 @@ ESP-NOW provides a basic ACK at the MAC layer, but we add application-level sequ
 
 1. **Replay protection**: Receiver maintains `last_seen_seq` per peer and session. Any authentic packet with `seq <= last_seen_seq` is dropped. The counter restarts only with a new session, whose new key makes packets from earlier sessions fail authentication (see [Sessions](#sessions)).
 2. **Ordering**: Input events must be applied in order. If packet N+1 arrives before N, the receiver buffers N+1 briefly (up to 5 ms) waiting for N. If N doesn't arrive, N+1 is applied and N is considered lost.
-3. **Acknowledged input**: key events, modifier syncs, and mouse moves that change the button state go out with `ACK_REQUESTED`. The receiving board applies the packet, then answers `MSG_INPUT_ACK{seq}`. The sender keeps at most one such packet outstanding and sends nothing queued after it until it is acknowledged, retransmitting it (with a new sequence number) if no acknowledgement arrives within 25 ms, up to 6 attempts in total. This preserves order, so the peer never sees "key up" before a late "key down", and a lost acknowledgement is harmless: the copy is applied again, and input messages carry state ("key A is down"), not toggles. Relayed daemon messages (HANDOFF, LOCK/UNLOCK) use the same mechanism; PAIR_* will too.
+3. **Acknowledged input**: key events, modifier syncs, and mouse moves that change the button state go out with `ACK_REQUESTED`. The receiving board applies the packet, then answers `MSG_INPUT_ACK{seq}`. The sender keeps at most one such packet outstanding and sends nothing queued after it until it is acknowledged, retransmitting it (with a new sequence number) if no acknowledgement arrives within 25 ms, up to 6 attempts in total. This preserves order, so the peer never sees "key up" before a late "key down", and a lost acknowledgement is harmless: the copy is applied again, and input messages carry state ("key A is down"), not toggles. Relayed daemon messages (VIEW, LOCK/UNLOCK) and `MSG_HOST_GONE` use the same mechanism; PAIR_* will too. `MSG_KEY_STATE` does not: it is repeated every second anyway.
 4. **Plain mouse movement is not acknowledged or retransmitted**: a 10 ms-old delta is worse than a dropped one (it makes the pointer jump), and the next movement corrects the position anyway.
 
 **Why end-to-end.** ESP-NOW already retries at the MAC layer and reports each frame as delivered or failed, but "delivered" only means the peer's radio received it. A first version resent key events when ESP-NOW reported a failure, matching reports to frames in send order; a key was still lost with every frame reported delivered. With `MSG_INPUT_ACK`, a line typed into a Mac at 24 Mbps from the worst spot, with 20% of frames failing, arrived intact after 27 retransmissions.

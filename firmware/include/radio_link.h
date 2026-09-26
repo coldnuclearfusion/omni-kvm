@@ -23,23 +23,25 @@
 
 namespace radio_link {
 
-// Called with each input or relayed packet (64 bytes) received from the peer.
+// Called with each input, relayed or MSG_HOST_GONE packet (64 bytes)
+// received from the peer.
 using PacketHandler = void (*)(const uint8_t *packet);
 
 // Starts the radio and ESP-NOW. Call once from setup().
-void begin(PacketHandler onInput, PacketHandler onRelay);
+void begin(PacketHandler onInput, PacketHandler onRelay, PacketHandler onHostGone);
 
 // Handles received packets and sends queued ones. Call on every loop pass.
 void update();
 
-// True while the peer has been heard within the last 3 seconds.
+// True while the peer has been heard within the last second (T_link).
 bool isLinkUp();
 
 // Queues a 64-byte protocol packet for the peer. Its header seq is
 // replaced with this board's radio sequence number. Packets go out in
 // order; a key event, mouse button change or relayed message whose
 // delivery fails is sent again before anything queued after it. Returns
-// false if the link is down or the queue is full.
+// false if the link is down, the queue is full, or the packet has data
+// past what the radio carries (proto::fitsSealedData).
 bool sendToPeer(const uint8_t *packet);
 
 // Free slots in the send queue. Callers can stop reading input while it
