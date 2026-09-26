@@ -25,7 +25,8 @@
 //!   numbered close requests fix it.)
 //! - Keepalives are sent only once faults have stopped (`complete`): they
 //!   spread views and repair key states, which is about where runs end up,
-//!   not about the rules that must hold in every state.
+//!   not about the rules that must hold in every state. So is the
+//!   `MSG_HOST_GONE` a board without a daemon repeats every second.
 //! - Pointer positions, time beyond "in some order", and the operating
 //!   systems' own quirks are not modelled (the experiments cover those).
 
@@ -293,7 +294,7 @@ impl World {
                     self.board_command(x, ToBoard::KeyState(mask));
                 }
                 Action::StartSettle => self.c[x].settle_pending = true,
-                Action::Forwarding(_) | Action::Pointer(_) => {}
+                Action::Pointer(_) => {}
             }
         }
     }
@@ -754,6 +755,11 @@ impl World {
                 if w.c[x].daemon.is_some() && w.c[x].board && w.link_up {
                     w.handle(x, Event::KeepaliveDue);
                 }
+                // A board without a daemon repeats MSG_HOST_GONE, so a lost
+                // copy is repaired (F8; found by the automated check, 4).
+                if w.c[x].daemon.is_none() && w.c[x].board && w.link_up {
+                    w.send_air(x, Air::HostGone);
+                }
             }
         }
         Ok(w)
@@ -944,6 +950,53 @@ fn settle_time_is_needed() {
     let error = explore(&cfg).expect_err("expected an echo without the settle time");
     assert!(error.starts_with("S3"), "expected an echo (S3), got: {error}");
     println!("as expected without the settle time:\n{error}");
+}
+
+/// Follows `steps` from a start with the given daemons running, as a
+/// failed check prints them, and returns the world reached.
+fn replay(cfg: &Config, daemons: [bool; 2], steps: &[Step]) -> World {
+    let mut w = World::new(daemons, cfg);
+    for &step in steps {
+        let (_, next) = w
+            .successors(cfg)
+            .into_iter()
+            .find(|(s, _)| *s == step)
+            .unwrap_or_else(|| panic!("{step:?} is not possible here"));
+        w = next.unwrap_or_else(|e| panic!("{step:?} broke a rule: {e}"));
+    }
+    w
+}
+
+/// Found by the deeper run (docs/focus-design.md, found by the automated
+/// check, 4): the PC forwards a key to the Mac, its daemon crashes, and
+/// the MSG_HOST_GONE its board sends is lost. The key must still come up,
+/// whether or not the Mac daemon runs.
+#[test]
+fn a_lost_host_gone_is_repaired() {
+    let cfg = Config { actions: 3, faults: 2, ..CHECKED };
+    let (pc, mac) = (0, 1);
+    let steps = [
+        Step::Air(pc),
+        Step::Move(pc),
+        Step::CaptureEdge(pc),
+        Step::Air(pc),
+        Step::Daemon(pc),
+        Step::Settle(pc),
+        Step::Press(pc, 1),
+        Step::Capture(pc),
+        Step::Air(pc),
+        Step::Crash(pc),
+        Step::Lose(pc),
+        Step::Capture(mac),
+    ];
+    for daemons in [[true, true], [true, false]] {
+        let w = replay(&cfg, daemons, &steps);
+        // Where the run ends up once faults stop (what `check` looks at in
+        // the quiet state that draining the queues leads to).
+        if let Err(e) = w.check_eventually(&cfg) {
+            panic!("daemons running {daemons:?}: {e}");
+        }
+    }
 }
 
 #[test]

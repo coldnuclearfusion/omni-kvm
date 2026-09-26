@@ -38,8 +38,9 @@ bool isLinkUp();
 
 // Queues a 64-byte protocol packet for the peer. Its header seq is
 // replaced with this board's radio sequence number. Packets go out in
-// order; a key event, mouse button change or relayed message whose
-// delivery fails is sent again before anything queued after it. Returns
+// order; a key event, modifier sync, mouse button change, relayed
+// message or MSG_HOST_GONE that is not acknowledged in time is sent again
+// before anything queued after it. Returns
 // false if the link is down, the queue is full, or the packet has data
 // past what the radio carries (proto::fitsSealedData).
 bool sendToPeer(const uint8_t *packet);

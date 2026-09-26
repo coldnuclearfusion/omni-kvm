@@ -2,6 +2,8 @@
 // HID level, as the built-in keyboard and trackpad would, on request.
 // Commands, one per line, written to /tmp/mac_input.cmd:
 //   hotkey          Command+Esc
+//   shift-down      hold left Shift (types no character)
+//   shift-up        let go of it
 //   push-left N     move the pointer left N steps of 20 points (past the edge)
 //   push-right N    the same to the right
 //   where           log where the pointer is
@@ -81,6 +83,12 @@ while true {
             case "hotkey":
                 hotkey()
                 log("hotkey (Command+Esc)")
+            case "shift-down":
+                key(0x38, down: true, flags: .maskShift)
+                log("left Shift down")
+            case "shift-up":
+                key(0x38, down: false, flags: [])
+                log("left Shift up")
             case "push-left":
                 let start = pointer()
                 push(dx: -20, steps: count)

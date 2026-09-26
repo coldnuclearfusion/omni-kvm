@@ -1,13 +1,13 @@
 """Load a board's USB serial link both ways and watch it.
 
-    python usb_stress.py PORT SECONDS PREVENT REPAIR STATS_PER_S [REPAIR_AT]
+    python usb_stress.py PORT SECONDS PREVENT STATS_PER_S
 
-Sets the board's USB guard (PREVENT, REPAIR: 0 or 1) and its diagnostic
-reports on, then sends zero-length mouse moves as fast as it can (load
-towards the board) and asks for link stats STATS_PER_S times a second
-(each answered by a 64-byte packet: load towards this computer). With
-REPAIR_AT, the repair is switched on that many seconds in. A write the
-board does not take within 0.5 s is counted, not fatal. Prints per 5 s.
+Sets the board's "prevent" setting (PREVENT: 0 or 1; see
+firmware/include/usb_guard.h) and its diagnostic reports on, then sends
+zero-length mouse moves as fast as it can (load towards the board) and
+asks for link stats STATS_PER_S times a second (each answered by a
+64-byte packet: load towards this computer). A write the board does not
+take within 0.5 s is counted, not fatal. Prints per 5 s.
 """
 import struct
 import sys
@@ -28,9 +28,8 @@ def guard(setting, on):
 
 port = serial.Serial(sys.argv[1], 115200, timeout=0, write_timeout=0.5)
 seconds = float(sys.argv[2])
-prevent, repair = sys.argv[3] == "1", sys.argv[4] == "1"
-stats_interval = 1.0 / float(sys.argv[5])
-repair_at = float(sys.argv[6]) if len(sys.argv) > 6 else None
+prevent = sys.argv[3] == "1"
+stats_interval = 1.0 / float(sys.argv[4])
 timeouts = 0
 
 
@@ -44,10 +43,8 @@ def write(data):
         return False
 
 
-write(guard(1, prevent) + guard(2, repair) + guard(3, True))
-print(f"guard: prevent {'on' if prevent else 'off'}, repair {'on' if repair else 'off'}, "
-      f"{1 / stats_interval:.0f} stats requests/s"
-      + (f", repair on at {repair_at:.0f} s" if repair_at is not None else ""), flush=True)
+write(guard(1, prevent) + guard(3, True))
+print(f"prevent {'on' if prevent else 'off'}, {1 / stats_interval:.0f} stats requests/s", flush=True)
 
 move = packet(0x01, struct.pack("<hhB", 0, 0, 0))
 stats_request = packet(0x40, bytes([0x04]))
@@ -62,10 +59,6 @@ while True:
     t = now - start
     if t >= seconds:
         break
-    if repair_at is not None and t >= repair_at:
-        write(guard(2, True))
-        print(f"t={t:5.1f} s  repair switched on", flush=True)
-        repair_at = None
     before = timeouts
     if write(move):
         moves += 1

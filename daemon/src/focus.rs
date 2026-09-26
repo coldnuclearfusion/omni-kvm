@@ -127,8 +127,6 @@ pub enum Action {
     OpenGate,
     /// Start the settle timer; SettleDone when it runs out.
     StartSettle,
-    /// Start or stop forwarding own input.
-    Forwarding(bool),
     /// Send the other board the keys and buttons still held that were
     /// forwarded ([`Machine::forwarded_held`]). It lets go of any others
     /// it holds, which repairs a release the radio lost (B5).
@@ -283,8 +281,8 @@ impl Machine {
             }
             Event::SettleDone => {
                 if self.mode == (Mode::Closing { confirmed: true }) {
+                    // Own input is forwarded from now on (routing follows the mode).
                     self.mode = Mode::Unfocused;
-                    out.push(Action::Forwarding(true));
                 }
             }
             Event::GateTimeout => {
@@ -376,8 +374,8 @@ impl Machine {
                     out.push(place(entry));
                 }
                 Mode::Unfocused => {
-                    // Stop forwarding before opening the gate (S3).
-                    out.push(Action::Forwarding(false));
+                    // The mode changes before the gate opens, so own input
+                    // stops being forwarded first (S3).
                     out.push(Action::OpenGate);
                     self.mode = Mode::Focused;
                     out.push(place(entry));
@@ -401,7 +399,6 @@ impl Machine {
                     out.push(Action::Pointer(Pointer::Resume));
                 }
                 Mode::Unfocused => {
-                    out.push(Action::Forwarding(false));
                     out.push(Action::OpenGate);
                     self.mode = Mode::Split;
                     out.push(Action::Pointer(Pointer::Resume));

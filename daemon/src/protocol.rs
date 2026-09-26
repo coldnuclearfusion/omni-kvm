@@ -1,4 +1,4 @@
-//! Omni-KVM protocol v0.1: packet layout and constants.
+//! Omni-KVM protocol (version byte 0x01): packet layout and constants.
 //!
 //! The specification is `shared/protocol.md` (the single source of
 //! truth); the firmware's copy is `firmware/include/protocol.h`. Keep

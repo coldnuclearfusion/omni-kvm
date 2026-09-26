@@ -51,10 +51,10 @@ static PacketHandler inputHandler = nullptr;
 static PacketHandler relayHandler = nullptr;
 static PacketHandler hostGoneHandler = nullptr;
 
-// Input packets waiting to go out, in order.
+// Packets waiting to go out, in order.
 struct Outgoing {
     uint8_t packet[proto::PACKET_SIZE];
-    bool needsAck;          // key event or mouse button change: must arrive
+    bool needsAck;          // must arrive (see needsAck())
 };
 static Outgoing txQueue[TX_QUEUE_LEN];
 static size_t txHead = 0;
@@ -353,7 +353,8 @@ static void handle(Received &r) {
         PacketHandler handler = isInput ? inputHandler : isHostGone ? hostGoneHandler : relayHandler;
         if (handler) handler(r.data);
         // Acknowledge after processing, so "acknowledged" means "applied"
-        // (for a relayed message: handed to the host). A retransmitted
+        // (for a relayed message: passed to the host, or dropped because
+        // no daemon listens). A retransmitted
         // copy is processed again, which is harmless: input messages
         // carry state ("key A is down"), not toggles, and daemons must
         // accept a relayed message twice.
@@ -410,7 +411,8 @@ static void printStats() {
                       stats.rttMinUs, stats.rttSumUs / stats.rttCount, stats.rttMaxUs);
     }
     if (stats.inputSent || stats.inputReceived) {
-        Serial.printf("[radio] input sent %u, received %u | since boot: retransmitted %u, gave up %u\n",
+        Serial.printf("[radio] acknowledged packets sent %u, received %u | since boot: retransmitted %u, "
+                      "gave up %u\n",
                       stats.inputSent, stats.inputReceived, total.inputRetransmits, total.inputGaveUp);
     }
     Serial.printf("[radio] crypto %s: seal avg %u us, open avg %u us | auth failures %u, replays dropped %u\n",
@@ -457,7 +459,7 @@ void begin(PacketHandler onInput, PacketHandler onRelay, PacketHandler onHostGon
 }
 
 #if OMNI_TEST_REPLAY
-// ── Replay attack test (build flag OMNI_TEST_REPLAY=1, test only) ──
+// ── Replay attack test (build env test_replay, test only) ──
 // This board plays the attacker: it records one of its own sealed
 // heartbeats and later re-sends the recording raw. The peer's log shows
 // what happened ("replays dropped" or "auth failures").

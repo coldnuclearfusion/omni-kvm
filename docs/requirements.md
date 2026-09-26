@@ -6,8 +6,10 @@ these rules by their IDs (B1, S3, F6, ...).
 
 Status: agreed with the project owner on 2026-09-26, after Phase 4 testing
 showed that fixing problems one at a time kept breaking something else
-(see [Why this document exists](#why-this-document-exists)). Nothing is
-built or flashed until the design has been checked against these rules.
+(see [Why this document exists](#why-this-document-exists)). Nothing was
+built or flashed until the design had been checked against these rules
+(`docs/focus-design.md`); firmware 0.5.3 and daemon 0.2.0 implement it and
+passed acceptance testing on 2026-09-26 (`docs/acceptance-tests.md`).
 
 ## Terms
 
@@ -23,7 +25,7 @@ built or flashed until the design has been checked against these rules.
   computer's input into its own computer (F6).
 - **T_link**: time to notice that the radio link is gone: **1 s**.
 - **Keepalive**: the regular message each daemon sends the other, at
-  least once a second (today `MSG_EDGE_CONTACT`).
+  least once a second (`MSG_VIEW`).
 
 The layout is fixed for now: the Windows PC on the left, the Mac on the
 right. The pointer crosses at the PC's right edge and the Mac's left edge.
@@ -56,8 +58,8 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
   - After a hotkey switch, the new screen's pointer resumes where it had
     stopped.
   - When the link is lost, each pointer resumes where it had stopped
-    (this replaces "move it to the centre of the main display" in
-    `architecture.md`).
+    (this replaced an earlier plan to move it to the centre of the main
+    display).
 - **B5. No stuck keys.** After any switch, link loss, restart or crash, no
   key or mouse button is left held down on either computer.
 - **B6. Keystrokes arrive once, in order.** None are lost, doubled or
@@ -101,8 +103,11 @@ right. The pointer crosses at the PC's right edge and the Mac's left edge.
   Esc in an app. The modifier pressed first (Win, Command) goes out
   before anyone can know Escape will follow, and is released at once;
   that must not open the Windows Start menu (which Windows opens when it
-  sees the Windows key pressed and released alone). How depends on
-  experiment A7.
+  sees the Windows key pressed and released alone). Built as: a board that
+  lets go of a GUI key on its own presses Ctrl first, and the Windows
+  daemon taps the unassigned virtual key 0xE8 whenever it keeps a key
+  press from Windows while a Windows key is held (`docs/focus-design.md`,
+  section 6); acceptance test 4 passed.
 - **H5. Later:** hotkeys become configurable, with a left-/right-handed
   choice.
 - **H6. Setting "pass the hotkey on"** (default: off). When on, the hotkey
@@ -223,6 +228,7 @@ The design is checked against all of these, alone and combined:
 - **A1.** A background program can keep the Mac pointer hidden reliably on
   macOS 27 ("SetsCursorInBackground", seen working once) while putting
   it back after every movement.
+  - Seen working (2026-09-26): acceptance tests 3 and 7b.
 - **A2.** Two keyboards typing into one computer: Hangul composes correctly
   on Windows and macOS, and a modifier held on one keyboard applies to
   keys on the other.
@@ -233,7 +239,7 @@ The design is checked against all of these, alone and combined:
     keyboard.
   - Decided (2026-09-26): the Mac daemon adds the modifiers held on every
     keyboard to input passed to the Mac (its event tap changes the
-    events' flags). To check with the new daemon.
+    events' flags). Checked: acceptance test 5 passed (2026-09-26).
 - **A3.** On Windows, mouse movement typed in by the board is visible to the
   daemon (Raw Input), so edge pushes with the Mac's trackpad count.
   - Seen (2026-09-25): during Phase 4 testing the PC daemon took the
@@ -241,6 +247,10 @@ The design is checked against all of these, alone and combined:
     PC's right edge.
 - **A4.** The Mac event tap was switched off because the tap callback moved
   the pointer (hypothesis); doing that on a worker thread stops it.
+  - Not seen since daemon 0.2.0: the daemon logs every time macOS switches
+    its tap off (and switches it back on), and its log from 2026-09-26,
+    acceptance and remote tests with hundreds of focus switches included,
+    has no such line.
 - **A5.** The board stopped sending to its computer because data was left in
   the USB transmit buffer without a flush (hypothesis). Reproduce with the
   old firmware under load; check the new firmware does not do it.
@@ -259,8 +269,9 @@ The design is checked against all of these, alone and combined:
     `firmware/include/usb_guard.h` and `shared/protocol.md`,
     MSG_BOARD_REPORT). Firmware 0.5.1 lays the FIFOs out itself.
   - Checked (2026-09-26), same load, one board: no stop in 600 s
-    (67,637 replies, longest gap 23 ms). Still to check: both boards with
-    the radio relay, as first reproduced.
+    (67,637 replies, longest gap 23 ms). Both boards, as first reproduced
+    (the other board relaying 100 messages/s to it, 20 stats requests a
+    second): no stop in 300 s (longest gap 0.5 s).
 - **A6.** The longest stall HID reports and log output can cause on a board.
 - **A7.** Hotkey side effects: does Win+Esc or Command+Esc reach the app in
   front as Esc? Does the Start menu open after the hotkey? Is Command+Esc

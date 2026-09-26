@@ -12,12 +12,16 @@
 // the peer over the radio; input packets from the peer are typed into
 // this board's host as keyboard/mouse reports while the input gate is
 // open. Daemon-to-daemon messages (views) are passed along to the peer's
-// daemon unread.
+// daemon unread. The USB guard (usb_guard.h) works around defects in the
+// USB driver underneath.
 //
-// LED: green = no peer, blue = radio link up.
+// LED: blinks every 500 ms, blue while the radio link is up, green
+// otherwise.
 //
-// Cables:  "UART" port -> PC (upload + debug log)
-//          "USB"  port -> the computer to control (can be the same PC)
+// Cables:  "USB"  port -> this board's own computer (its daemon, and the
+//                         keyboard/mouse the other computer types with)
+//          "UART" port -> a computer, for uploads, the log and development
+//                         commands; not needed in use
 // ============================================================
 
 #include <Arduino.h>
@@ -153,9 +157,9 @@ static bool gateOpen = true;
 
 // A close is confirmed (status 0x06) once the releases it caused have
 // reached the host: the daemon's settle time starts at the confirmation,
-// so it then only has to cover the host's own handling of them. If USB
-// takes no reports for GATE_CONFIRM_LIMIT_MS, it is confirmed anyway, so
-// the switch still goes ahead.
+// so it then only has to cover the host's own handling of them. If they
+// have not all reached it GATE_CONFIRM_LIMIT_MS after the close, it is
+// confirmed anyway, so the switch still goes ahead.
 static const uint32_t GATE_CONFIRM_LIMIT_MS = 50;
 static bool confirmPending = false;
 static uint8_t confirmNumber = 0;
@@ -233,9 +237,17 @@ static void injectInput(const uint8_t *raw) {
     }
 }
 
-// The peer's daemon disconnected (MSG_HOST_GONE): the keys and buttons it
-// pressed here can no longer be released by it.
+// Development counters (UART command "host report").
+static uint32_t hostGonesSent = 0;
+static uint32_t hostGonesReceived = 0;
+static uint32_t hostGoneReleases = 0;
+
+// The peer has no daemon (MSG_HOST_GONE, repeated every second): the keys
+// and buttons its daemon pressed here can no longer be released by it.
 static void onPeerHostGone(const uint8_t *) {
+    hostGonesReceived++;
+    if (!hid_output::holding()) return;
+    hostGoneReleases++;
     hid_output::releaseAll();
     Serial.println("[radio] the other computer's daemon is gone: let go of its keys and buttons");
 }
@@ -317,18 +329,29 @@ static void watchDaemon() {
 }
 
 // MSG_HOST_GONE goes out behind whatever the daemon queued for the radio
-// before it left. With the link down it is not needed: the peer lets go
-// of everything on link loss anyway.
+// before it left, and again every HOST_GONE_INTERVAL_MS while no daemon is
+// connected and the link is up. It is state ("no daemon here"), like the
+// views and the key state: a copy lost on the radio even after every retry
+// is repaired a second later (docs/focus-design.md, found by the automated
+// check, 4). With the link down it is not needed: the peer lets go of
+// everything on link loss anyway.
+static const uint32_t HOST_GONE_INTERVAL_MS = 1000;
+
 static void sendHostGone() {
-    if (!hostGoneToSend) return;
-    if (!radio_link::isLinkUp()) {
+    static uint32_t lastSentMs = 0;
+    if (daemonConnected() || !radio_link::isLinkUp()) {
         hostGoneToSend = false;
         return;
     }
+    if (!hostGoneToSend && millis() - lastSentMs < HOST_GONE_INTERVAL_MS) return;
     uint8_t packet[proto::PACKET_SIZE] = {};
     proto::Header header = {proto::MAGIC, proto::VERSION, proto::MSG_HOST_GONE, 0, 0};
     memcpy(packet, &header, sizeof(header));
-    if (radio_link::sendToPeer(packet)) hostGoneToSend = false;
+    if (radio_link::sendToPeer(packet)) {
+        hostGoneToSend = false;
+        lastSentMs = millis();
+        hostGonesSent++;
+    }
 }
 
 // ── Development: diagnostic reports ──────────────────────
@@ -412,7 +435,7 @@ static void setUsbGuard(uint8_t setting, bool on) {
         case 9: usb_guard::requestDriverResetImitation(); return;
         default: return;
     }
-    Serial.printf("[usb] guard setting %u %s\n", setting, on ? "on" : "off");
+    Serial.printf("[dev] setting %u %s\n", setting, on ? "on" : "off");
 }
 
 // ── Development: commands on the UART port ────────────────
@@ -423,6 +446,7 @@ static void setUsbGuard(uint8_t setting, bool on) {
 //   usb k6          imitate the USB driver's own reset (setting 9)
 //   usb layout      print the USB FIFO layout (setting 4)
 //   usb report      print one board report line
+//   host report     print the daemon connection and MSG_HOST_GONE counts
 static void runUartCommand(const char *command) {
     if (strcmp(command, "usb reconnect") == 0) {
         usb_guard::requestReconnect();
@@ -432,6 +456,10 @@ static void runUartCommand(const char *command) {
         usb_guard::logFifoLayout();
     } else if (strcmp(command, "usb report") == 0) {
         reportOnce = true;
+    } else if (strcmp(command, "host report") == 0) {
+        Serial.printf("[host] daemon connected %u | MSG_HOST_GONE sent %u, received %u, let go of something %u\n",
+                      (unsigned)daemonConnected(), (unsigned)hostGonesSent, (unsigned)hostGonesReceived,
+                      (unsigned)hostGoneReleases);
     } else {
         Serial.printf("[uart] unknown command: %s\n", command);
         return;
@@ -595,17 +623,19 @@ void setup() {
     radio_link::begin(injectInput, relayToHost, onPeerHostGone);
 
     Serial.println("========================================");
-    Serial.println("  Omni-KVM Firmware v0.5.3-dev (Phase 4)");
+    Serial.println("  Omni-KVM Firmware v0.5.4-dev (Phase 4)");
     Serial.println("  Board: ESP32-S3-DevKitC-1-N8R8");
     Serial.println("========================================");
     Serial.println();
-    Serial.println("Forwarding host input to the peer over ESP-NOW.");
+    Serial.println("Forwarding this computer's input to the peer, typing the peer's in while the gate is open.");
     Serial.println();
 }
 
 // ── Loop: runs repeatedly after setup ─────────────────────
-// Nothing here waits: packets are read as they arrive, and keyboard
-// reports leave at a paced rate from hid_output's queue.
+// Nothing here waits, except that a keyboard or mouse report can take up
+// to 100 ms to leave (docs/platform.md, K5): packets are read as they
+// arrive, and keyboard reports leave at a paced rate from hid_output's
+// queue.
 void loop() {
     usb_guard::update();    // first: no USB transfer may start with a bad FIFO layout
     if (usb_guard::watch(daemonConnected() && toHostCount > 0, hostBytes)) {

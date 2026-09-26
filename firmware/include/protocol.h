@@ -1,5 +1,5 @@
 // ============================================================
-// Omni-KVM Protocol v0.1 — packet layout and constants
+// Omni-KVM protocol (version byte 0x01) — packet layout and constants
 // ============================================================
 // The specification lives in shared/protocol.md and is the single
 // source of truth. Keep this file in sync with it.
@@ -28,10 +28,12 @@ enum MsgType : uint8_t {
     MSG_KEY_DOWN         = 0x03,
     MSG_KEY_UP           = 0x04,
     MSG_MODIFIER_SYNC    = 0x05,
-    MSG_INPUT_ACK        = 0x06,   // receiver -> sender: "input packet <seq> processed"
+    MSG_INPUT_ACK        = 0x06,   // board to board: "packet <seq> processed" (input, relayed, HOST_GONE)
     MSG_KEY_STATE        = 0x07,   // keys and buttons still held (repairs lost releases)
     MSG_VIEW             = 0x10,   // daemon to daemon; relayed, never read by the firmware
     MSG_BOARD_REPORT     = 0x1E,   // development: a board's diagnostic report, for the other host
+    // Reserved in shared/protocol.md, not implemented: pairing, lock,
+    // version mismatch, error, firmware update.
     MSG_HEARTBEAT        = 0x20,
     MSG_HEARTBEAT_ACK    = 0x21,
     MSG_SESSION_HELLO    = 0x22,
@@ -56,18 +58,19 @@ inline bool isInputMessage(uint8_t msgType) {
     return (msgType >= MSG_MOUSE_MOVE && msgType <= MSG_MODIFIER_SYNC) || msgType == MSG_KEY_STATE;
 }
 
-// Messages between the two daemons (focus 0x10–0x1F, lock 0x50–0x5F).
-// The boards pass them along without reading them: host → board → radio
-// → peer board → peer's host. Whole ranges, so new daemon messages need
-// no firmware change. Only the first 28 bytes after the header survive
-// the radio (SEALED_DATA_SIZE).
+// Messages between the two daemons (focus 0x10–0x1F, lock 0x50–0x5F),
+// and MSG_BOARD_REPORT, which a board sends itself. The boards pass them
+// along without reading them: host → board → radio → peer board → peer's
+// host. Whole ranges, so new daemon messages need no firmware change. Like
+// every packet from the host, they must fit in the 28 data bytes the radio
+// carries (SEALED_DATA_SIZE); a longer one is discarded as garbled.
 inline bool isRelayMessage(uint8_t msgType) {
     return (msgType >= 0x10 && msgType <= 0x1F) || (msgType >= 0x50 && msgType <= 0x5F);
 }
 
 // Header flags (bits 3–7 are reserved and must be 0)
 constexpr uint8_t FLAG_ACK_REQUESTED = 1 << 0;
-constexpr uint8_t FLAG_IS_ACK        = 1 << 1;
+constexpr uint8_t FLAG_IS_ACK        = 1 << 1;   // reserved, never set (acknowledgements are MSG_INPUT_ACK)
 constexpr uint8_t FLAG_ENCRYPTED     = 1 << 2;
 
 // Sealed (encrypted) radio packets — see shared/protocol.md "Encryption":
@@ -137,21 +140,24 @@ struct __attribute__((packed)) SessionHello {
 static_assert(sizeof(SessionHello) <= SEALED_DATA_SIZE, "HELLO must fit in a sealed packet");
 
 // MSG_DAEMON_CMD / MSG_DAEMON_STATUS: between a host and its own board
-// over USB CDC only, never over the radio (so not limited to 28 bytes).
+// over USB CDC only, never over the radio. A command must still fit in 28
+// data bytes: the board checks that for every packet from its host.
 constexpr uint8_t CMD_REQUEST_LINK_STATS = 0x04;
 constexpr uint8_t CMD_SET_PHY_RATE = 0x07;      // development: data[0] = wifi_phy_rate_t
 constexpr uint8_t CMD_GATE_OPEN = 0x08;
 constexpr uint8_t CMD_GATE_CLOSE = 0x09;        // data[0] = request number
-constexpr uint8_t CMD_USB_GUARD = 0x0A;         // development: data[0] = 1 prevent, 3 board
-                                                // reports, 4 log FIFO layout, 7 host filler;
-                                                // data[1] = 1 on, 0 off
+constexpr uint8_t CMD_USB_GUARD = 0x0A;         // development settings: data[0] = 1 prevent,
+                                                // 3 board reports, 4 log FIFO layout, 7 host
+                                                // filler, 8 USB reconnect, 9 imitate the USB
+                                                // driver's own reset; data[1] = 1 on, 0 off
 constexpr uint8_t STATUS_LINK_STATS = 0x03;
 constexpr uint8_t STATUS_LINK_CHANGED = 0x05;   // data[0] = 1 up, 0 down
 constexpr uint8_t STATUS_GATE_CLOSED = 0x06;    // data[0] = the request number it answers
 constexpr uint8_t LINK_STATS_LAYOUT = 3;        // bump whenever LinkStats changes
 
-// Counters since boot. "host_*" are input packets from this board's host;
-// "radio_*" are input packets over the radio.
+// Counters since boot. "host_*" are input and relayed packets from this
+// board's host; "radio_*" are packets over the radio that need an
+// acknowledgement (input, relayed, MSG_HOST_GONE).
 struct __attribute__((packed)) LinkStats {
     uint8_t status_id;              // STATUS_LINK_STATS
     uint8_t layout;                 // LINK_STATS_LAYOUT, so readers can detect a mismatch
@@ -159,11 +165,11 @@ struct __attribute__((packed)) LinkStats {
     uint8_t phy_rate;               // current radio TX rate (wifi_phy_rate_t)
     uint32_t session;               // session generation (0 = none yet)
     uint32_t host_received;
-    uint32_t host_dropped;          // not queued for the radio: link down, or queue full
-    uint32_t radio_sent;            // input packets handed to ESP-NOW, retransmissions included
-    uint32_t radio_retransmits;     // input packets sent again after a failed delivery
-    uint32_t radio_gave_up;         // input packets still undelivered after every attempt
-    uint32_t radio_received;        // authentic input packets from the peer
+    uint32_t host_dropped;          // not queued for the radio (link down, queue full), or garbled
+    uint32_t radio_sent;            // handed to ESP-NOW, retransmissions included
+    uint32_t radio_retransmits;     // sent again: no MSG_INPUT_ACK within the timeout
+    uint32_t radio_gave_up;         // never acknowledged after every attempt
+    uint32_t radio_received;        // authentic ones from the peer
     uint32_t radio_rx_overflow;     // any packet dropped because the receive queue was full
     uint32_t auth_failures;
     uint32_t replays_dropped;
@@ -176,8 +182,8 @@ static_assert(sizeof(LinkStats) <= PAYLOAD_SIZE, "LinkStats must fit in a packet
 static_assert(sizeof(LinkStats) == 56, "Layout changed: bump LINK_STATS_LAYOUT and update the readers "
                                        "(tools/hid_test.py, daemon/src/protocol.rs)");
 
-// MSG_INPUT_ACK: sent by the receiving board after it has processed an
-// input packet that carried FLAG_ACK_REQUESTED.
+// MSG_INPUT_ACK: sent by the receiving board after it has processed a
+// packet that carried FLAG_ACK_REQUESTED.
 struct __attribute__((packed)) InputAck {
     uint32_t seq;           // the acknowledged packet's header seq
 };
@@ -186,7 +192,7 @@ struct __attribute__((packed)) InputAck {
 // heartbeat's timestamp so the original sender can compute the RTT.
 struct __attribute__((packed)) Heartbeat {
     uint32_t timestamp;     // sender's micros()
-    uint8_t link_quality;   // 0 = not measured
+    uint8_t link_quality;   // always 0: reserved for a link quality measure
 };
 
 }  // namespace proto

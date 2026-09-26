@@ -1,4 +1,4 @@
-# Focus design (draft)
+# Focus design
 
 How the two computers agree on where input goes, and what each daemon and
 board does about it. It implements [requirements.md](requirements.md);
@@ -55,7 +55,7 @@ view = (epoch, decider, holder)
   has seen + 1:
   - switch decided here (edge push or hotkey): holder = the other computer;
   - link lost, other daemon went silent, or own board lost: holder = split.
-- **Start:** `(0, -, split)`.
+- **Start:** `(0, itself, split)`.
 
 This is a "last writer wins" register, a standard way to keep a value
 consistent between two places without a central referee:
@@ -66,7 +66,7 @@ consistent between two places without a central referee:
 | View doubled | Adopting the same view twice changes nothing |
 | View late | An older view is ignored |
 | Two switches at once | Same epoch; the tie rule picks one on both sides |
-| One daemon restarts | Its `(0, -, split)` is older than anything; it adopts the other's view |
+| One daemon restarts | Its `(0, itself, split)` is older than any view with epoch 1 or more; it adopts the other's view (at epoch 0 both are split anyway) |
 | Both restart / link back after loss | Both hold split views; they agree |
 
 A single daemon restart therefore *rejoins* the current state (for
@@ -166,7 +166,9 @@ to split every 3 seconds.
   down on its computer and drops keyboard reports not sent yet (F6). It
   also releases everything when the link is lost, when the other board
   restarts, and when the other board reports that its computer's daemon
-  disconnected (`HOST_GONE`, F8).
+  disconnected (`HOST_GONE`, F8). A board without a daemon repeats
+  `HOST_GONE` every second while the link is up, so a lost one is
+  repaired (found by the automated check, 4).
 - **Key state:** with every keepalive, a node that forwards also sends
   the keys and buttons it still holds that were forwarded (`KEY_STATE`).
   The receiving board lets go of any it holds that are not in it. A
@@ -204,7 +206,7 @@ to split every 3 seconds.
 | Item | Behaviour |
 |---|---|
 | Gate | Open or closed. `GATE_CLOSE` → release all, drop waiting reports, reply `GATE_CLOSED`. `GATE_OPEN` → open. |
-| Own daemon not connected | Gate open (B8); tell the other board `HOST_GONE` (F8). |
+| Own daemon not connected | Gate open (B8); tell the other board `HOST_GONE` (F8), at once and then every second while the link is up. |
 | Link state change | Reported to the daemon at once (F9). Link declared lost after 1 s without the other board (T_link). |
 | Relay | Unchanged: daemon messages pass through in order per direction, retried, possibly lost or doubled. |
 
@@ -220,8 +222,10 @@ to split every 3 seconds.
 | `LINK_CHANGED` | own board → daemon | link up or down |
 | `HOST_GONE` | board → board (radio) | – |
 
-Retired: `HANDOFF`, `HANDOFF_ACK`, `EDGE_CONTACT`, `HANDBACK`. Numbers are
-assigned when `shared/protocol.md` is updated.
+Their numbers are in `shared/protocol.md`: VIEW 0x10, KEY_STATE 0x07,
+HOST_GONE 0x23, GATE_OPEN/GATE_CLOSE commands 0x08/0x09, LINK_CHANGED and
+GATE_CLOSED statuses 0x05/0x06. Retired: `HANDOFF`, `HANDOFF_ACK`,
+`EDGE_CONTACT` (and `HANDBACK`, a draft name never used).
 
 ## 9. Examples
 
@@ -316,7 +320,7 @@ own quirks are left to the experiments.
 | Design as above | 2 user actions, 1 fault, every order | **842,381 states, every check holds** |
 | Same, hotkey passed on (H6) | same | **887,163 states, every check holds** |
 | Without the settle time (R2) | 3 user actions, no fault | **echo found** (S3): the settle time is needed |
-| Deeper | 3 user actions, 2 faults | tens of millions of states: more than memory allows this way; to be run with a leaner checker |
+| Deeper | 3 user actions, 2 faults | **B5 broken** at depth 12, after 24.7 million states (18 minutes on 20 threads): see [Found by the automated check](#found-by-the-automated-check), 4. With the fix, the run outgrew memory (46 GB wanted, 32 GB in the PC) and was stopped; the full bound needs a leaner checker (compact states, exploring only one order of events that do not affect each other). |
 
 A user action is a key press, a movement or a hotkey; key releases,
 restarts and reconnections come on top, free. A fault is a lost or
@@ -332,7 +336,7 @@ listed with why it keeps the checked rules.
 | Implementation detail | Why the rules still hold |
 |---|---|
 | The machine is shared by the input thread and the board thread; what it decides, and each input packet to forward, goes into one queue, filled only while the machine is locked (`hub.rs`). | The board receives commands and forwarded input in the order the machine decided them, as in the model, where commands take effect at once. The lock is held for microseconds, never across a wait (D3). |
-| The board confirms a gate close only once the releases it caused have reached the computer (or after 50 ms if USB takes no reports). | At the confirmation the releases are in the operating system's queue, as the model has them; the settle time then covers the capture. In the 50 ms case, a Ctrl press added for a held Windows key could reach the capture after the settle time and be forwarded: a stray Ctrl tap on the other computer, nothing worse. |
+| The board confirms a gate close only once the releases it caused have reached the computer (or 50 ms after the close, if they have not). | At the confirmation the releases are in the operating system's queue, as the model has them; the settle time then covers the capture. In the 50 ms case, a Ctrl press added for a held Windows key could reach the capture after the settle time and be forwarded: a stray Ctrl tap on the other computer, nothing worse. |
 | Auto-repeat: a repeat goes where its key's press went and changes nothing (`route_held`). | The model has no repeats; routing them like the press they belong to keeps D7 and S4. |
 | Windows reads movement twice: the hooks decide what Windows sees, Raw Input gives the unaccelerated counts. Raw Input forwards movement only while the hooks' latest decision is also "forward". | Movement Windows was given is never also forwarded (S4) unless the input thread stalls for more than the settle time between the two. |
 | Windows: a key-down more than 1.5 s after the key's previous event is a new press whose release never reached the hook (the lock screen took it); the missed release is routed first. | The pressed map stays true to the keys actually held (D7, B5). |
@@ -340,11 +344,12 @@ listed with why it keeps the checked rules.
 | macOS: input passed to the Mac gets the modifiers passed to it from every keyboard added to its flags (A2). A release on any keyboard clears that modifier. | Nothing is forwarded or held because of it; a modifier cannot get stuck, at worst one is not added while two keyboards hold it. |
 | The "other daemon silent" timer restarts with every board connection. | A daemon heard before must answer again within 3 s (S8); one never heard is still never taken for silent (B8). |
 | A gate close not confirmed in 100 ms makes the daemon drop its board connection and reconnect. | The machine has already fallen back to split mode for the missing board; the reconnection is the model's unplug and replug. |
+| D4 is built only on macOS: the Mac daemon switches its event tap back on when macOS switches it off. The Windows daemon does not notice if Windows removes its low-level hooks (Windows does so when a hook callback takes too long). | A gap, not covered: input would then reach Windows unrouted until the daemon restarts. How long Windows lets a hook callback take is still to be measured (`docs/platform.md`, section 6). |
 
 ## Found by the automated check
 
 Each of these broke a rule in a run the check constructed; the design
-above already includes the fix.
+above includes the fix.
 
 1. **Switching with the link down** (broke S7). Hotkey, then the other
    board unplugged: the switch went through, and all input went into a
@@ -358,6 +363,17 @@ above already includes the fix.
 3. **A lost key release** (broke B5). A key pressed while forwarding, its
    release lost on the radio: the key stayed down on the other computer.
    Now the key state goes with every keepalive (section 5).
+4. **A lost MSG_HOST_GONE** (broke B5; found 2026-09-26 by the deeper
+   run). The PC's focus goes to the Mac, a PC key goes down and
+   reaches the Mac, then the PC daemon crashes and the one `HOST_GONE` its
+   board sends is lost on the radio. Nothing else lets go of the key: the
+   crashed daemon sends no key state, and the link stays up, so the Mac
+   board holds it for good. In the firmware, `HOST_GONE` is retried like
+   acknowledged input (6 attempts), so every attempt has to fail while the
+   link stays up. Now a board repeats `HOST_GONE` once a second while it
+   has no daemon and the link is up, making it state like the views and
+   the key state, so a lost copy is repaired a second later. The check
+   has it; the run is kept as a test (`a_lost_host_gone_is_repaired`).
 
 ## Review items
 

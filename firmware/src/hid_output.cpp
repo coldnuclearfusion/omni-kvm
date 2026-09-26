@@ -12,8 +12,8 @@
 namespace hid_output {
 
 // Minimum gap between keyboard reports. Reports ~1 ms apart came out
-// garbled on Windows in Phase 1 testing; 10 ms worked. The real
-// minimum is still to be measured against the latency budget.
+// garbled on Windows in Phase 1 testing (Korean IME input); 10 ms worked
+// (docs/platform.md, section 5).
 static const uint32_t KEY_REPORT_GAP_MS = 10;
 static const size_t KEY_QUEUE_LEN = 128;
 
@@ -165,6 +165,11 @@ static void letGoTo(const KeyReport &target) {
 void releaseAll() {
     letGoTo(KeyReport{});
     if (mouseButtons != 0) mouseMove(0, 0, 0);
+}
+
+bool holding() {
+    static const KeyReport none = {};
+    return memcmp(&keyState, &none, sizeof(keyState)) != 0 || mouseButtons != 0;
 }
 
 void dropPending() {

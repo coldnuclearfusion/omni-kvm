@@ -55,7 +55,8 @@
 // is how an old transfer outlives a reset. (Measured: the disconnect by
 // itself dropped the transfer under way; the endpoints are stopped
 // anyway.) After RECONNECT_OFF_MS it connects again, and the host resets
-// and configures the device anew.
+// and configures the device anew (if it has not within WAIT_FOR_HOST_MS,
+// the watchdog carries on watching and logs it).
 // From the disconnect until that new configuration, fifosReady() and
 // serialOpen() are false: no IN transfer starts, and the daemon counts as
 // gone. At most once per RECONNECT_MIN_INTERVAL_MS.

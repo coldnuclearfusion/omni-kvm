@@ -83,8 +83,6 @@ impl Guard<'_> {
                 Action::CloseGate(n) => Out::CloseGate(n),
                 Action::OpenGate => Out::OpenGate,
                 Action::StartSettle => Out::StartSettle,
-                // The mode says whether input is forwarded; the log shows it.
-                Action::Forwarding(_) => continue,
                 // Taken now, so that it matches the input queued before it.
                 Action::SendKeyState => match input::key_state(inner.machine.forwarded_held()) {
                     Some(state) => Out::KeyState(state),

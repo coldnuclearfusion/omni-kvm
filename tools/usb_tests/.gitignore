@@ -1,0 +1,4 @@
+# What the tests write next to themselves
+*.log
+*.cmd
+input_driver

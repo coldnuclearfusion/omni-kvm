@@ -100,14 +100,18 @@ class Link:
         while time.time() < deadline:
             buf += self.serial.read(PACKET_SIZE)
             start = buf.find(bytes([MAGIC, VERSION, MSG_DAEMON_STATUS]))
-            if start >= 0 and len(buf) - start >= PACKET_SIZE:
-                payload = buf[start + 8:start + PACKET_SIZE]
-                if payload[0] == STATUS_LINK_STATS:
-                    if payload[1] != LINK_STATS_LAYOUT:
-                        sys.exit(f"Board sends link stats layout {payload[1]}, this tool reads "
-                                 f"layout {LINK_STATS_LAYOUT}. Flash the current firmware.")
-                    values = struct.unpack_from(LINK_STATS_FORMAT, payload, 2)
-                    return dict(zip(LINK_STATS_FIELDS, values))
+            if start < 0 or len(buf) - start < PACKET_SIZE:
+                continue
+            payload = buf[start + 8:start + PACKET_SIZE]
+            buf = buf[start + PACKET_SIZE:]
+            # Other statuses come too, e.g. "link up" (0x05), which the
+            # board sends as soon as the port is opened.
+            if payload[0] == STATUS_LINK_STATS:
+                if payload[1] != LINK_STATS_LAYOUT:
+                    sys.exit(f"Board sends link stats layout {payload[1]}, this tool reads "
+                             f"layout {LINK_STATS_LAYOUT}. Flash the current firmware.")
+                values = struct.unpack_from(LINK_STATS_FORMAT, payload, 2)
+                return dict(zip(LINK_STATS_FIELDS, values))
         sys.exit("No link stats reply from the board.")
 
     def set_phy_rate(self, name):

@@ -1,7 +1,8 @@
 # Acceptance tests
 
-Tests run by hand with both computers, after the automated checks
-(daemon unit tests and the focus model check) pass. Each run records the
+Tests run with both computers, by hand or, where a run says so, driven
+by software, after the automated checks (daemon unit tests and the focus
+model check) pass. Each run records the
 firmware and daemon versions, what was done, what was seen, and what was
 not tested.
 
@@ -27,7 +28,10 @@ Air (native USB port); both daemons running; Mac input source Korean
 Not tested:
 
 - Keys or buttons left held on the other computer when a daemon quits
-  or crashes while one is held (F8, `MSG_HOST_GONE`).
+  or crashes while one is held (F8, `MSG_HOST_GONE`), by hand. The
+  deeper model check found that a lost `MSG_HOST_GONE` left such a key
+  held; fixed in firmware 0.5.4 (`docs/focus-design.md`, found by the
+  automated check, 4).
 - Link loss by distance or interference (only by unplugging).
 - The Windows PC or the Mac going to sleep and waking up.
 - A game that reads the keyboard and mouse directly (A8).
@@ -57,3 +61,18 @@ nobody at the computers: every action came from software.
 | E3 | With the focus on the Mac, board 2's driver resets itself (imitated K6) while the Mac daemon has the port open: the Mac did not reset the device; the USB watchdog reconnected it after 1.5 s of a stuck serial endpoint; split mode meanwhile; then switching both ways | S7, S10 | Pass |
 | E4a | Same as E2 with board 1 (Windows) | S7, S10 | Pass |
 | E4b | Same as E3 with board 1: Windows reset the device within a second (keeping the COM port), the firmware stopped the transfer left over from before the reset, the PC daemon reconnected; then switching both ways | S7, S10 | Pass |
+
+Soak runs the same evening (`tools/usb_tests/soak.py`): the Mac hotkey
+twice per cycle, each switch checked on both daemons, and USB events on
+the boards taking turns (reconnect, imitated driver reset):
+
+| Firmware, daemon | Length | Switches | USB events | Result |
+|---|---|---|---|---|
+| 0.5.3-dev, 0.2.0 | 8 min slow + 60 min fast | 16 + 662 | 27 | All passed. Seen meanwhile on the boards: 3 real driver resets (K6), 8 watchdog reconnections, 10 forgotten transfers stopped, no old data sent. |
+| 0.5.4-dev, 0.2.0 (cleaned up) | 5 min | 52 | 4 | 51 passed. **Once, one hotkey switched twice**: to the Mac (view 47) and at once back to the PC (view 48), both decided by the Mac. Right after view 47 the PC's board sent about 9 more acknowledged packets than usual, so the PC most likely forwarded key events to the Mac. Most likely real input: the project owner came home and moved the mouse at about that time, and the Mac pointer was found moved (a push past the Mac's left edge, by any device, moves the focus to the PC). Not certain, because the daemons do not log why a switch was decided; such a log would settle cases like this. |
+
+MSG_HOST_GONE repeated (firmware 0.5.4-dev), same evening: with the focus
+on the PC and a Shift held on the Mac forwarded to the PC, the Mac daemon
+was stopped. The PC's board let go of the Shift 1 s later, once; the Mac's
+board then repeated `MSG_HOST_GONE` once a second (9 in 9 s, 34 in 34 s)
+without further effect, and stopped when the Mac daemon was back.

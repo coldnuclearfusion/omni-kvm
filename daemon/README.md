@@ -1,10 +1,11 @@
 # Omni-KVM daemon
 
-Host-side program (Rust). It talks to the board plugged into this computer
-over USB (the board's "USB" port, a CDC serial port). On Windows it
-captures the keyboard and mouse to control the other computer. On macOS
-it places the pointer where Windows hands it over and tells Windows when
-the pointer touches a screen edge (Phase 4, step 2).
+Host-side program (Rust), one on each computer: Windows (the PC) and macOS
+(the Mac). It talks to the board plugged into its computer over USB (the
+board's "USB" port, a CDC serial port), captures its computer's keyboard
+and mouse or trackpad, and with the other daemon keeps one shared focus:
+which computer all the keyboards and mice drive. The design is in
+`docs/focus-design.md`, the requirements in `docs/requirements.md`.
 
 ## Build and run (Windows)
 
@@ -25,58 +26,101 @@ cargo build --release
 ./target/release/omni-kvm /dev/cu.usbmodemE8F60A8DB00C2    # or name the port
 ```
 
+The daemon reads the keyboard and trackpad with an event tap, which needs
+the **Accessibility** permission (and **Input Monitoring**, where System
+Settings lists it) for the app that starts it, e.g. Terminal. Until it has
+them, it says so and waits.
+
 macOS lists each serial device twice, as `/dev/cu.*` and `/dev/tty.*`;
 the daemon uses the `cu.` one. The name ends with the board's MAC address.
-Reading and moving the pointer needs no macOS permission.
 
-## Using it (Windows keyboard and mouse)
+On both systems it finds the board by its USB vendor ID (0x303A) and looks
+again every 2 s while there is none; with two boards plugged in, name the
+port. Only one daemon runs at a time on a computer (a lock file in the
+temporary directory).
 
-- **To the Mac**: push the pointer past the **right** edge of the screen and
-  keep pushing a little (virtual resistance), or press **Scroll Lock** (on
-  many keyboards: `Fn` + a key marked "ScrLk", e.g. Home). The Mac pointer
-  appears near its left edge, at the same height.
-- **Back to Windows**: push the Mac pointer past the Mac's **left** edge (same
-  resistance), or press **Scroll Lock**. The Windows pointer appears near its
-  right edge, at the height it left the Mac.
-- While the Mac is in control, Windows sees no keyboard or mouse input: it
-  all goes over the radio. The Windows key acts as Command on a Mac, Alt as
-  Option.
-- If the radio link drops, input returns to Windows automatically.
-- Without the Mac daemon, the Mac still works as a plain USB keyboard and
-  mouse, but it can neither place its pointer nor report its edges: the
-  pointer is pushed to the Mac's left edge at whatever height it was, and
-  only Scroll Lock comes back. The Windows daemon says which case applies
-  (`[peer] the other computer's daemon is running`).
+## Using it
 
-**Emergency exit**: Ctrl+Alt+Del cannot be captured by any program; from
-there, Task Manager can end `omni-kvm.exe`, which removes its hooks at once.
+Both daemons start in **split mode**: each computer's own keyboard and
+mouse drive only that computer.
+
+- **Focus on the other computer**: on the PC, push the pointer past the
+  **right** edge and keep pushing a little (virtual resistance), or press
+  **Win+Esc** or **Scroll Lock**; on the Mac, push past the **left** edge,
+  or press **Command+Esc**. From then on the keyboards and mice of *both*
+  computers drive the focused one. The pointer enters at the facing edge,
+  at the same height.
+- **Back**: the same hotkey on either computer, or pushing past the
+  focused Mac's left edge. The hotkey is decided by the computer it is
+  pressed on, so it works whatever the other daemon is doing, even if it
+  is not running.
+- The completing key of a hotkey (Escape, Scroll Lock) goes nowhere; the
+  Windows key or Command pressed with it goes where the focus was. No
+  Start menu opens (`docs/focus-design.md`, section 6).
+- A key or button held while the focus moves is released where it was
+  pressed, so nothing stays stuck.
+- If the radio link drops, the other board is gone, or the other daemon
+  stops answering for 3 s, both computers go back to split mode. A board
+  whose daemon is gone acts as a plain USB keyboard and mouse for the other
+  computer.
+- The Windows key acts as Command on the Mac, Alt as Option.
+
+**Emergency exit.** On the Mac, Command+Esc always brings the focus back
+(and if the Mac daemon itself stops answering, macOS switches its event
+tap off and input goes straight to the Mac). On Windows, Win+Esc or Scroll
+Lock does the same; Ctrl+Alt+Del cannot be captured by any program, and
+from there Task Manager can end `omni-kvm.exe`, which removes its hooks at
+once.
 
 ## How it works
 
-- Low-level keyboard and mouse hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) let
-  input through in Local mode and swallow it in Remote mode.
-- Keys are identified by scan code (physical position, independent of the
-  layout or IME) and translated to USB HID usages (`src/keymap.rs`).
-- Mouse movement comes from Raw Input: the mouse's own counts, before
-  Windows pointer acceleration, since the receiving OS applies its own.
-- Keys and buttons held during a switch are released on the side that no
-  longer has control, so nothing stays stuck.
-- The two daemons talk through the boards (`src/peer.rs`): `MSG_HANDOFF`
-  says where the pointer enters, as a fraction of the screen height;
-  `MSG_EDGE_CONTACT` says which edges the Mac pointer touches. Pushing past
-  an edge is decided on Windows, the only side that sees the mouse's
-  movement once the Mac pointer stops at the edge. See
-  `shared/protocol.md`.
+| Module | Role |
+|---|---|
+| `main.rs` | Board connection, timers (keepalive, link stats, timeouts), log lines |
+| `focus.rs` | The focus state machine, model-checked in `focus/check.rs` (`cargo test`) |
+| `hub.rs` | Feeds events to the machine and carries out its outputs in order |
+| `hotkey.rs` | Recognizes GUI+Escape (Scroll Lock is checked by the Windows capture) |
+| `input_windows.rs` | Low-level keyboard and mouse hooks plus Raw Input |
+| `input_macos.rs` | Quartz event tap at the HID level |
+| `screen_windows.rs`, `screen_macos.rs` | Screen edges, pointer entry, hiding the Mac pointer |
+| `keymap.rs`, `keymap_macos.rs` | Keys to USB HID usages |
+| `input.rs` | Shared input helpers (held keys, modifier bits) |
+| `board.rs` | Finding and opening the board, assembling packets |
+| `protocol.rs` | Message layouts (`shared/protocol.md`) |
+| `log.rs` | Log lines, written on their own thread |
+
+- Every input event is routed by the focus state machine: passed to this
+  computer, forwarded to the board (which sends it over the radio to the
+  other board, which types it in), or dropped.
+- Keys are identified by physical position (scan code on Windows, key code
+  on macOS), independent of the layout or IME, and translated to USB HID
+  usages. Forwarded mouse movement on Windows comes from Raw Input, before
+  Windows' pointer acceleration, since the Mac applies its own.
+- The two daemons keep the focus in step by sending each other their view
+  of it (`MSG_VIEW`) through the boards, once a second and on every change.
+  Before a daemon forwards its own input it closes its board's input gate,
+  so nothing the other computer typed in comes back round.
+- The Mac adds the modifiers held on every keyboard to what it passes on
+  (macOS keeps them per keyboard), so Shift on one keyboard and a letter on
+  the other make a capital (Hangul too).
 - The daemon never records what is typed.
+
+## Log
+
+Lines go to standard output, without timestamps: `[focus]` changes of the
+shared focus, `[link]` radio link state and, every 10 s, link statistics,
+`[peer]` whether the other daemon is answering, `[input]` capture notes,
+and plain lines when the board is found or lost.
 
 ## Current limitations
 
-- The Mac is assumed to be to the right of Windows. On the Mac, only the
+- The Mac is assumed to be to the right of the PC. On the Mac, only the
   outer edges of the whole display arrangement count.
-- The Mac daemon checks the pointer every 10 ms and the board every 5 ms
-  (polling), which costs a little battery; to be made event-driven.
+- Trackpad scrolling is inverted when forwarded (`INVERT_TRACKPAD_SCROLL`
+  in `input_macos.rs`), to match the developer's setup.
 - Windows does not send input from elevated (administrator) windows to a
   non-elevated program's hooks, and nothing reaches them on the secure
-  desktop (UAC prompts, Ctrl+Alt+Del screen).
-- Scroll Lock is taken over as the hotkey.
-- Console programs for now; no tray icon or auto-start yet.
+  desktop (UAC prompts, the Ctrl+Alt+Del screen). macOS hides keystrokes
+  from every event tap while a password field or other secure input is
+  active.
+- Console programs for now; no tray icon, settings or auto-start yet.

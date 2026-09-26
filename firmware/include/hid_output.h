@@ -1,10 +1,10 @@
 // ============================================================
 // HID output — turns protocol input events into USB HID reports
 // ============================================================
-// Events can arrive in bursts (from the radio, or from the PC in
-// Phase 1 tests). Keyboard reports are therefore queued and sent at
-// a paced rate by update(); see docs/architecture.md ("Pacing HID
-// reports"). Mouse reports are sent immediately.
+// Events can arrive from the radio in bursts. Keyboard reports are
+// therefore queued and sent at a paced rate by update() (at least 10 ms
+// apart; docs/platform.md, section 5). Mouse reports are sent at once, or
+// dropped if USB is not ready.
 // ============================================================
 
 #pragma once
@@ -30,11 +30,17 @@ void mouseMove(int16_t dx, int16_t dy, uint8_t buttons);
 void mouseScroll(int16_t vertical, int16_t horizontal);
 
 // Lets go of every key, modifier and mouse button, e.g. when the peer
-// that pressed them is gone and its "key up" can never arrive. A
+// that pressed them is gone and its "key up" can never arrive. (A mouse
+// button release, like any mouse report, is dropped if USB is not ready;
+// the next mouse report carries the buttons again.) A
 // Windows/Command key let go of this way (or by keepOnly) gets a Ctrl
 // press first, so that Windows does not take it for a lone Windows-key
 // tap and open the Start menu; the Ctrl goes up with the rest.
 void releaseAll();
+
+// True while any key, modifier or mouse button is held down for the other
+// computer (or will be, once queued reports are sent).
+bool holding();
 
 // The host let go of everything: the device was disconnected from it.
 // The keyboard state it should have goes to it again once it is back;
